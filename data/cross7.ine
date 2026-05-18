@@ -135,3 +135,4 @@ end
 allbases
 incidence
 printcobasis 1
+threads 0
