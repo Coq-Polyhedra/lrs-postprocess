@@ -40,6 +40,10 @@ fn strictly_sorted_len(v: &[usize]) -> Result<usize> {
     Ok(v.len())
 }
 
+fn contains_sorted(v: &[usize], x: usize) -> bool {
+    v.binary_search(&x).is_ok()
+}
+
 fn row_matrix_columns_from_global_rows(h: &HRep, rows: &[usize]) -> Result<Vec<Vec<Q>>> {
     if strictly_sorted_len(rows)? != h.d {
         bail!(
@@ -137,9 +141,17 @@ fn check_items_basic(h: &HRep, cert: &Certificate) -> Result<()> {
     Ok(())
 }
 
-fn check_mod2_cycle(h: &HRep, cert: &Certificate) -> Result<()> {
+#[derive(Debug, Clone)]
+struct RidgeIncident {
+    item: usize,
+    simplex: usize,
+    missing_row: usize,
+}
+
+fn check_ridges(h: &HRep, cert: &Certificate) -> Result<()> {
     let d = h.d;
-    let mut ridge_parity: HashMap<Vec<usize>, bool> = HashMap::new();
+
+    let mut ridge_map: HashMap<Vec<usize>, Vec<RidgeIncident>> = HashMap::new();
 
     for (k, item) in cert.items.iter().enumerate() {
         for sidx in 0..item.simplices.len() {
@@ -158,22 +170,84 @@ fn check_mod2_cycle(h: &HRep, cert: &Certificate) -> Result<()> {
             }
 
             for r in 0..d {
+                let missing_row = sigma[r];
+
                 let mut ridge = sigma.clone();
                 ridge.remove(r);
 
-                let entry = ridge_parity.entry(ridge).or_insert(false);
-                *entry = !*entry;
+                ridge_map
+                    .entry(ridge)
+                    .or_default()
+                    .push(RidgeIncident {
+                        item: k,
+                        simplex: sidx,
+                        missing_row,
+                    });
             }
         }
     }
 
-    let bad = ridge_parity
-        .into_iter()
-        .find(|(_, odd)| *odd)
-        .map(|(ridge, _)| ridge);
+    for (ridge, incs) in ridge_map {
+        if incs.len() != 2 {
+            bail!(
+                "ridge {:?} is incident to {} simplices, expected exactly 2",
+                ridge,
+                incs.len()
+            );
+        }
+    }
 
-    if let Some(ridge) = bad {
-        bail!("mod-2 cycle check failed: odd ridge {:?}", ridge);
+    Ok(())
+}
+
+fn sorted_subset(a: &[usize], b: &[usize]) -> bool {
+    // Assumes both are strictly sorted.
+    let mut i = 0;
+    let mut j = 0;
+
+    while i < a.len() && j < b.len() {
+        if a[i] == b[j] {
+            i += 1;
+            j += 1;
+        } else if a[i] > b[j] {
+            j += 1;
+        } else {
+            return false;
+        }
+    }
+
+    i == a.len()
+}
+
+fn check_incident_sets_antichain(cert: &Certificate) -> Result<()> {
+    let mut sizes = Vec::with_capacity(cert.items.len());
+
+    for (k, item) in cert.items.iter().enumerate() {
+        let size = strictly_sorted_len(&item.incident)
+            .with_context(|| format!("item {k}: incident list is not strictly sorted"))?;
+        sizes.push(size);
+    }
+
+    for i in 0..cert.items.len() {
+        for j in (i + 1)..cert.items.len() {
+            let si = sizes[i];
+            let sj = sizes[j];
+
+            if si < sj {
+                if sorted_subset(&cert.items[i].incident, &cert.items[j].incident) {
+                    bail!(
+                        "incident set of item {i} is strictly contained in incident set of item {j}"
+                    );
+                }
+            } else if sj < si {
+                if sorted_subset(&cert.items[j].incident, &cert.items[i].incident) {
+                    bail!(
+                        "incident set of item {j} is strictly contained in incident set of item {i}"
+                    );
+                }
+            }
+            // If si == sj, strict inclusion is impossible.
+        }
     }
 
     Ok(())
@@ -269,6 +343,8 @@ fn check_same_label_separators(
     Ok(())
 }
 
+
+
 fn check_root(h: &HRep, cert: &Certificate) -> Result<()> {
     let Some(root) = &cert.root else {
         bail!("certificate has no `root` field; cannot check B3");
@@ -276,50 +352,8 @@ fn check_root(h: &HRep, cert: &Certificate) -> Result<()> {
 
     let inverse_rows = check_root_inverse(h, cert, root)?;
 
-    /* check_root_vertex_strictly_maximizes(cert, root, &c_star)
-        .context("root direction does not uniquely select the root vertex")?; */
-
     check_same_label_separators(h, cert, root, &inverse_rows)
         .context("same-label separator check failed")?;
-
-    Ok(())
-}
-
-fn is_subset_sorted(a: &[usize], b: &[usize]) -> bool {
-    let mut i = 0;
-    let mut j = 0;
-
-    while i < a.len() && j < b.len() {
-        if a[i] == b[j] {
-            i += 1;
-            j += 1;
-        } else if a[i] > b[j] {
-            j += 1;
-        } else {
-            return false;
-        }
-    }
-
-    i == a.len()
-}
-
-fn check_incident_antichain(cert: &Certificate) -> Result<()> {
-    for k in 0..cert.items.len() {
-        for l in 0..cert.items.len() {
-            if k == l {
-                continue;
-            }
-
-            let lk = &cert.items[k].incident;
-            let ll = &cert.items[l].incident;
-
-            if is_subset_sorted(lk, ll) {
-                bail!(
-                    "incident-set antichain check failed: incident set of item {k} is contained in incident set of item {l}"
-                );
-            }
-        }
-    }
 
     Ok(())
 }
@@ -329,9 +363,13 @@ pub fn check_certificate(ine_path: &str, certificate_path: &str) -> Result<()> {
     let cert = read_certificate(certificate_path)?;
 
     check_items_basic(&h, &cert).context("basic item consistency check failed")?;
-    check_mod2_cycle(&h, &cert).context("mod-2 cycle check failed")?;
+
+    check_ridges(&h, &cert).context("ridge check failed")?;
+
     check_root(&h, &cert).context("root check failed")?;
-    check_incident_antichain(&cert).context("incident-set antichain check failed")?;
+
+    check_incident_sets_antichain(&cert)
+        .context("incident-set antichain check failed")?;
 
     Ok(())
 }
