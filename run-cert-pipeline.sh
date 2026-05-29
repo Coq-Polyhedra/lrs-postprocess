@@ -14,7 +14,12 @@ LRSGMP="${LRSGMP:-$LRS_DIR/lrsgmp}"
 BIN="${BIN:-./target/release/lrs-postprocess}"
 
 CERT_GEN="${CERT_GEN:-$BIN postprocess --pretty}"
+BIN_CERT_GEN="${BIN_CERT_GEN:-$BIN postprocess --bin}"
 CHECKER="${CHECKER:-$BIN check}"
+
+COQC="${COQC:-coqc}"
+COQ_TEMPLATE="${COQ_TEMPLATE:-coq/InspectCertificate.v.template}"
+COQ_DIR="${COQ_DIR:-${DATA_DIR}/coq}"
 
 now_ms() {
     date +%s%3N
@@ -131,6 +136,31 @@ generate_certificate() {
         "$ext_file"
 }
 
+generate_binary_certificate() {
+    local base="$1"
+    local ine_file="${DATA_DIR}/${base}.ine"
+    local ext_file="${DATA_DIR}/${base}.ext"
+    local bin_file="${DATA_DIR}/${base}-cert.bin"
+    local log_file="${DATA_DIR}/${base}-bin.log"
+
+    check_binary
+
+    if [[ ! -f "$ine_file" ]]; then
+        echo "error: input .ine file not found: $ine_file" >&2
+        exit 1
+    fi
+
+    if [[ ! -f "$ext_file" ]]; then
+        echo "error: ext file not found: $ext_file" >&2
+        exit 1
+    fi
+
+    run_timed_stdout_to_file "generate binary certificate for $base" "$bin_file" "$log_file" \
+        $BIN_CERT_GEN \
+        "$ine_file" \
+        "$ext_file"
+}
+
 run_checker() {
     local base="$1"
     local ine_file="${DATA_DIR}/${base}.ine"
@@ -155,14 +185,54 @@ run_checker() {
         "$cert_file"
 }
 
+run_coq_binreader_test() {
+    local base="$1"
+    local bin_file="${DATA_DIR}/${base}-cert.bin"
+
+    # Coq module names cannot contain '-' characters, so sanitize the generated
+    # .v filename. This still keeps the original basename for data/log files.
+    local coq_base="${base//-/_}"
+    local v_file="${COQ_DIR}/${coq_base}_inspect.v"
+
+    local log_file="${DATA_DIR}/${base}-coq.log"
+
+    if [[ ! -f "$bin_file" ]]; then
+        echo "error: binary certificate not found: $bin_file" >&2
+        echo "hint: generate it with: $0 bin $base" >&2
+        exit 1
+    fi
+
+    if [[ ! -f "$COQ_TEMPLATE" ]]; then
+        echo "error: Coq template not found: $COQ_TEMPLATE" >&2
+        exit 1
+    fi
+
+    mkdir -p "$COQ_DIR"
+
+    local abs_bin_file
+    abs_bin_file="$(realpath "$bin_file")"
+
+    sed "s|__BIN_FILE__|${abs_bin_file}|g" "$COQ_TEMPLATE" > "$v_file"
+
+    run_timed "Coq/binreader test for $base" "$log_file" \
+        "$COQC" "$v_file"
+}
+
 clean_generated() {
     local base="$1"
 
     local ext_file="${DATA_DIR}/${base}.ext"
     local cert_file="${DATA_DIR}/${base}-cert.json"
+    local bin_file="${DATA_DIR}/${base}-cert.bin"
+
     local ext_log="${DATA_DIR}/${base}-ext.log"
     local cert_log="${DATA_DIR}/${base}-cert.log"
+    local bin_log="${DATA_DIR}/${base}-bin.log"
     local check_log="${DATA_DIR}/${base}-check.log"
+    local coq_log="${DATA_DIR}/${base}-coq.log"
+
+    local coq_base="${base//-/_}"
+    local coq_file="${COQ_DIR}/${coq_base}_inspect.v"
 
     echo
     echo "=== clean generated files for $base ==="
@@ -170,9 +240,13 @@ clean_generated() {
     rm -f \
         "$ext_file" \
         "$cert_file" \
+        "$bin_file" \
         "$ext_log" \
         "$cert_log" \
-        "$check_log"
+        "$bin_log" \
+        "$check_log" \
+        "$coq_log" \
+        "$coq_file"
 
     echo "--- cleaned generated files for $base ---"
 }
@@ -188,13 +262,21 @@ run_one() {
         cert)
             generate_certificate "$base"
             ;;
+        bin)
+            generate_binary_certificate "$base"
+            ;;
         check)
             run_checker "$base"
+            ;;
+        coq)
+            run_coq_binreader_test "$base"
             ;;
         all)
             compute_ext "$base"
             generate_certificate "$base"
             run_checker "$base"
+            generate_binary_certificate "$base"
+            run_coq_binreader_test "$base"
             ;;
         clean)
             clean_generated "$base"
@@ -212,7 +294,9 @@ Usage:
   $0 build
   $0 ext    BASE [BASE ...]
   $0 cert   BASE [BASE ...]
+  $0 bin    BASE [BASE ...]
   $0 check  BASE [BASE ...]
+  $0 coq    BASE [BASE ...]
   $0 all    BASE [BASE ...]
   $0 clean  BASE [BASE ...]
 
@@ -220,27 +304,40 @@ For each BASE, the script uses:
   ${DATA_DIR}/BASE.ine
   ${DATA_DIR}/BASE.ext
   ${DATA_DIR}/BASE-cert.json
+  ${DATA_DIR}/BASE-cert.bin
 
 Generated logs:
   ${DATA_DIR}/BASE-ext.log
   ${DATA_DIR}/BASE-cert.log
+  ${DATA_DIR}/BASE-bin.log
   ${DATA_DIR}/BASE-check.log
+  ${DATA_DIR}/BASE-coq.log
+
+Generated Coq files:
+  ${COQ_DIR}/BASE_inspect.v
+  where '-' in BASE is replaced by '_'.
 
 Examples:
   $0 build
   $0 all cross_9 cross_10 cross_11 cross_12
   $0 ext cross_9
   $0 cert cross_9 cross_10
+  $0 bin cross_9
   $0 check cross_12
+  $0 coq cross_9
   $0 clean cross_9 cross_10
 
 Environment variables:
-  DATA_DIR      directory containing input/output files, default: data
-  LRS_DIR       directory containing lrsgmp
-  LRSGMP        full path to lrsgmp
-  BIN           compiled Rust binary, default: ./target/release/complete-vertex-set
-  CERT_GEN      certificate generation command, default: "\$BIN postprocess --pretty"
-  CHECKER       checker command, default: "\$BIN check"
+  DATA_DIR       directory containing input/output files, default: data
+  LRS_DIR        directory containing lrsgmp
+  LRSGMP         full path to lrsgmp
+  BIN            compiled Rust binary, default: ./target/release/lrs-postprocess
+  CERT_GEN       JSON certificate command, default: "\$BIN postprocess --pretty"
+  BIN_CERT_GEN   binary certificate command, default: "\$BIN postprocess --bin"
+  CHECKER        checker command, default: "\$BIN check"
+  COQC           Coq compiler, default: coqc
+  COQ_TEMPLATE   Coq template, default: coq/InspectCertificate.v.template
+  COQ_DIR        generated Coq files directory, default: data/coq
 EOF
 }
 
@@ -265,7 +362,7 @@ case "$cmd" in
         fi
         build_tools
         ;;
-    ext|cert|check|all|clean)
+    ext|cert|bin|check|coq|all|clean)
         if [[ $# -lt 1 ]]; then
             echo "error: expected at least one basename" >&2
             usage

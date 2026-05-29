@@ -1,10 +1,13 @@
 use anyhow::{anyhow, bail, Context, Result};
+use std::io::{self, Write};
 
+mod binencode;
 mod certificate;
 mod checker;
 mod numerics;
 mod postprocess;
 
+use binencode::write_certificate_bin;
 use certificate::certificate_to_string;
 use checker::check_certificate;
 use postprocess::{
@@ -23,6 +26,7 @@ struct PostprocessArgs {
     ine_path: String,
     ext_path: String,
     pretty: bool,
+    bin: bool,
     k0: Option<usize>,
 }
 
@@ -40,6 +44,7 @@ fn print_help(program: &str) {
 
 Postprocess options:
   --pretty          Pretty-print JSON output
+  --bin             Write binary output for coq-binreader
   --k0 <INDEX>      Root vertex item index, 0-based.
                     Defaults to a vertex with the smallest number of simplices.
 
@@ -48,6 +53,7 @@ General options:
 
 Examples:
   {program} postprocess cross3.ine cross3.ext --pretty
+  {program} postprocess cross3.ine cross3.ext --bin > cross3-cert.bin
   {program} postprocess cross3.ine cross3.ext --pretty --k0 0
   {program} check cross3.ine certificate.json
 
@@ -80,6 +86,7 @@ where
     }
 
     let mut pretty = false;
+    let mut bin = false;
     let mut k0: Option<usize> = None;
 
     while let Some(arg) = it.next() {
@@ -91,6 +98,10 @@ where
 
             "--pretty" => {
                 pretty = true;
+            }
+
+            "--bin" => {
+                bin = true;
             }
 
             "--k0" => {
@@ -107,6 +118,10 @@ where
         }
     }
 
+    if pretty && bin {
+        bail!("options --pretty and --bin are incompatible");
+    }
+
     if positional.len() != 2 {
         print_help(program);
         bail!(
@@ -119,6 +134,7 @@ where
         ine_path: positional[0].clone(),
         ext_path: positional[1].clone(),
         pretty,
+        bin,
         k0,
     }))
 }
@@ -216,7 +232,15 @@ fn run_postprocess(args: PostprocessArgs) -> Result<()> {
     let root = Some(root_certificate(&h, &items, k0).context("failed to build root certificate")?);
 
     let cert = to_certificate(items, root);
-    println!("{}", certificate_to_string(&cert, args.pretty)?);
+
+    if args.bin {
+        let stdout = io::stdout();
+        let mut out = io::BufWriter::new(stdout.lock());
+        write_certificate_bin(&mut out, &cert)?;
+        out.flush()?;
+    } else {
+        println!("{}", certificate_to_string(&cert, args.pretty)?);
+    }
 
     Ok(())
 }

@@ -1,0 +1,10 @@
+Require Import PArray Uint63.
+From Bignums Require Import BigN BigZ BigQ.
+From BinReader Require Import BinReader.
+
+Time LoadData "__BIN_FILE__" As cert.
+
+Let items := fst cert.
+Let roots := snd cert.
+
+Eval vm_compute in PArray.length items.

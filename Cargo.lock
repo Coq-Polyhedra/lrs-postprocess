@@ -26,6 +26,7 @@ version = "0.2.0"
 dependencies = [
  "anyhow",
  "num-bigint",
+ "num-integer",
  "num-rational",
  "num-traits",
  "serde",
