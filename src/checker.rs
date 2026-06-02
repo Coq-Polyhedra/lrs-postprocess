@@ -1,8 +1,7 @@
 use anyhow::{anyhow, bail, Context, Result};
 use num_traits::{One, Zero};
-use std::collections::HashMap;
 
-use crate::certificate::{read_certificate, Certificate, Root, VertexItem};
+use crate::certificate::{read_certificate, AdjacentSimplex, Certificate, Root, VertexItem};
 use crate::numerics::{dot, mat_mul, parse_q, Q};
 use crate::postprocess::{parse_lrs_hrep, HRep};
 
@@ -75,6 +74,7 @@ fn decode_simplex_global(item: &VertexItem, simplex_index: usize) -> Result<Vec<
         .ok_or_else(|| anyhow!("invalid simplex index {simplex_index}"))?;
 
     simplex
+        .indices
         .iter()
         .map(|&local| {
             item.incident
@@ -83,6 +83,33 @@ fn decode_simplex_global(item: &VertexItem, simplex_index: usize) -> Result<Vec<
                 .ok_or_else(|| anyhow!("local simplex index {local} out of range"))
         })
         .collect()
+}
+
+fn ridge_from_simplex(sigma: &[usize], missing_pos: usize) -> Result<Vec<usize>> {
+    if missing_pos >= sigma.len() {
+        bail!(
+            "missing position {missing_pos} out of range 0..{}",
+            sigma.len()
+        );
+    }
+
+    let mut ridge = Vec::with_capacity(sigma.len().saturating_sub(1));
+
+    for (i, &x) in sigma.iter().enumerate() {
+        if i != missing_pos {
+            ridge.push(x);
+        }
+    }
+
+    Ok(ridge)
+}
+
+fn find_missing_pos_for_ridge(sigma: &[usize], ridge: &[usize]) -> Option<usize> {
+    if sigma.len() != ridge.len() + 1 {
+        return None;
+    }
+
+    (0..sigma.len()).find(|&r| ridge_from_simplex(sigma, r).ok().as_deref() == Some(ridge))
 }
 
 fn check_items_basic(h: &HRep, cert: &Certificate) -> Result<()> {
@@ -111,9 +138,17 @@ fn check_items_basic(h: &HRep, cert: &Certificate) -> Result<()> {
         }
 
         for (sidx, simplex) in item.simplices.iter().enumerate() {
-            let mut global_rows = Vec::with_capacity(simplex.len());
+            if simplex.adj.len() != h.d {
+                bail!(
+                    "item {k}, simplex {sidx}: adjacency list has length {}, expected d={}",
+                    simplex.adj.len(),
+                    h.d
+                );
+            }
 
-            for &local in simplex {
+            let mut global_rows = Vec::with_capacity(simplex.indices.len());
+
+            for &local in &simplex.indices {
                 if local >= item.incident.len() {
                     bail!(
                         "item {k}, simplex {sidx}: local index {local} out of range 0..{}",
@@ -135,65 +170,122 @@ fn check_items_basic(h: &HRep, cert: &Certificate) -> Result<()> {
                     h.d
                 );
             }
+
+            for (r, adj) in simplex.adj.iter().enumerate() {
+                if adj.item >= cert.items.len() {
+                    bail!(
+                        "item {k}, simplex {sidx}, ridge {r}: adjacent item {} out of range 0..{}",
+                        adj.item,
+                        cert.items.len()
+                    );
+                }
+
+                if adj.simplex >= cert.items[adj.item].simplices.len() {
+                    bail!(
+                        "item {k}, simplex {sidx}, ridge {r}: adjacent simplex {} out of range 0..{} for item {}",
+                        adj.simplex,
+                        cert.items[adj.item].simplices.len(),
+                        adj.item
+                    );
+                }
+            }
         }
     }
 
     Ok(())
 }
 
-#[derive(Debug, Clone)]
-struct RidgeIncident {
-    item: usize,
-    simplex: usize,
-    missing_row: usize,
-}
-
-fn check_ridges(h: &HRep, cert: &Certificate) -> Result<()> {
+/// Checks the explicit adjacency pointers stored in every simplex.
+///
+/// If simplex `(k,s)` has global rows `sigma`, then `sigma \ {sigma[r]}`
+/// is the ridge represented by occurrence `(k,s,r)`.  The certificate stores
+/// `simplices[s].adj[r] = (k',s')`.  The checker verifies that `(k',s')`
+/// really has the same ridge, and that its corresponding adjacency pointer
+/// points back to `(k,s)`.
+fn check_ridge_adjacencies(h: &HRep, cert: &Certificate) -> Result<()> {
     let d = h.d;
 
-    let mut ridge_map: HashMap<Vec<usize>, Vec<RidgeIncident>> = HashMap::new();
-
     for (k, item) in cert.items.iter().enumerate() {
-        for sidx in 0..item.simplices.len() {
+        for (sidx, simplex) in item.simplices.iter().enumerate() {
             let sigma = decode_simplex_global(item, sidx)
                 .with_context(|| format!("failed decoding item {k}, simplex {sidx}"))?;
 
-            let len = strictly_sorted_len(&sigma).with_context(|| {
-                format!("item {k}, simplex {sidx}: decoded global rows are not strictly sorted")
-            })?;
-
-            if len != d {
+            if strictly_sorted_len(&sigma)? != d {
                 bail!(
                     "item {k}, simplex {sidx}: decoded simplex has length {}, expected {d}",
-                    len
+                    sigma.len()
                 );
             }
 
             for r in 0..d {
-                let missing_row = sigma[r];
+                let adj = simplex.adj[r];
 
-                let mut ridge = sigma.clone();
-                ridge.remove(r);
+                if adj.item == k && adj.simplex == sidx {
+                    bail!("item {k}, simplex {sidx}, ridge {r}: self-adjacency is invalid");
+                }
 
-                ridge_map
-                    .entry(ridge)
-                    .or_default()
-                    .push(RidgeIncident {
-                        item: k,
-                        simplex: sidx,
-                        missing_row,
-                    });
+                let ridge = ridge_from_simplex(&sigma, r)?;
+
+                let adj_item = &cert.items[adj.item];
+                let adj_sigma = decode_simplex_global(adj_item, adj.simplex).with_context(|| {
+                    format!(
+                        "failed decoding adjacent simplex ({},{}) from ({},{}) ridge {}",
+                        adj.item, adj.simplex, k, sidx, r
+                    )
+                })?;
+
+                if strictly_sorted_len(&adj_sigma)? != d {
+                    bail!(
+                        "adjacent simplex ({},{}) has length {}, expected {d}",
+                        adj.item,
+                        adj.simplex,
+                        adj_sigma.len()
+                    );
+                }
+
+                let Some(adj_missing_pos) = find_missing_pos_for_ridge(&adj_sigma, &ridge) else {
+                    bail!(
+                        "item {k}, simplex {sidx}, ridge {r} = {:?} is not a ridge of adjacent simplex ({},{}) = {:?}",
+                        ridge,
+                        adj.item,
+                        adj.simplex,
+                        adj_sigma
+                    );
+                };
+
+                let back = cert.items[adj.item].simplices[adj.simplex].adj[adj_missing_pos];
+                if back != (AdjacentSimplex { item: k, simplex: sidx }) {
+                    bail!(
+                        "adjacency is not reciprocal: ({k},{sidx}) ridge {r} points to ({},{}), whose matching ridge {} points to ({},{})",
+                        adj.item,
+                        adj.simplex,
+                        adj_missing_pos,
+                        back.item,
+                        back.simplex
+                    );
+                }
+
+                if k != adj.item {
+                    let missing_row = sigma[r];
+                    let adj_missing_row = adj_sigma[adj_missing_pos];
+
+                    if contains_sorted(&cert.items[adj.item].incident, missing_row) {
+                        bail!(
+                            "local ridge test failed: simplex ({k},{sidx}) has exchanged row {missing_row}, but this row belongs to incident set of item {}",
+                            adj.item
+                        );
+                    }
+
+                    if contains_sorted(&cert.items[k].incident, adj_missing_row) {
+                        bail!(
+                            "local ridge test failed: simplex ({},{}) has exchanged row {}, but this row belongs to incident set of item {k}",
+                            adj.item,
+                            adj.simplex,
+                            adj_missing_row
+                        );
+                    }
+                }
             }
-        }
-    }
-
-    for (ridge, incs) in ridge_map {
-        if incs.len() != 2 {
-            bail!(
-                "ridge {:?} is incident to {} simplices, expected exactly 2",
-                ridge,
-                incs.len()
-            );
         }
     }
 
@@ -343,8 +435,6 @@ fn check_same_label_separators(
     Ok(())
 }
 
-
-
 fn check_root(h: &HRep, cert: &Certificate) -> Result<()> {
     let Some(root) = &cert.root else {
         bail!("certificate has no `root` field; cannot check B3");
@@ -364,12 +454,11 @@ pub fn check_certificate(ine_path: &str, certificate_path: &str) -> Result<()> {
 
     check_items_basic(&h, &cert).context("basic item consistency check failed")?;
 
-    check_ridges(&h, &cert).context("ridge check failed")?;
+    check_ridge_adjacencies(&h, &cert).context("ridge adjacency check failed")?;
 
     check_root(&h, &cert).context("root check failed")?;
 
-    check_incident_sets_antichain(&cert)
-        .context("incident-set antichain check failed")?;
+    check_incident_sets_antichain(&cert).context("incident-set antichain check failed")?;
 
     Ok(())
 }

@@ -12,7 +12,27 @@ pub struct Certificate {
 pub struct VertexItem {
     pub vertex: Vec<String>,
     pub incident: Vec<usize>,
-    pub simplices: Vec<Vec<usize>>,
+    pub simplices: Vec<Simplex>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Simplex {
+    /// Local indices into the corresponding VertexItem.incident list.
+    pub indices: Vec<usize>,
+
+    /// Adjacency pointers.  If indices has length d, then adj has length d.
+    /// The entry adj[i] points to the simplex adjacent through the ridge
+    /// obtained by deleting indices[i].
+    pub adj: Vec<AdjacentSimplex>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AdjacentSimplex {
+    /// Index of the adjacent vertex item.
+    pub item: usize,
+
+    /// Index of the adjacent simplex inside items[item].simplices.
+    pub simplex: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

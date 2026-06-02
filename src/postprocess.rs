@@ -3,7 +3,7 @@ use num_traits::Zero;
 use std::collections::BTreeMap;
 use std::fs;
 
-use crate::certificate::{Certificate, Root, VertexItem};
+use crate::certificate::{AdjacentSimplex, Certificate, Root, Simplex, VertexItem};
 use crate::numerics::{dot, identity, invert_matrix, mat_mul, parse_q, q_to_string, Q};
 
 #[derive(Debug, Clone)]
@@ -331,10 +331,93 @@ pub fn build_items(records: Vec<LrsRecord>) -> Result<Vec<VertexItem>> {
             })
             .collect::<Result<Vec<_>>>()?;
 
-        items[id].simplices.push(simplex);
+        items[id].simplices.push(Simplex {
+            indices: simplex,
+            adj: Vec::new(),
+        });
     }
 
+    fill_simplex_adjacencies(&mut items).context("failed to build simplex adjacency pointers")?;
+
     Ok(items)
+}
+
+
+#[derive(Debug, Clone)]
+struct RidgeOccurrence {
+    item: usize,
+    simplex: usize,
+    missing_pos: usize,
+}
+
+fn decoded_simplex_global_from_indices(item: &VertexItem, indices: &[usize]) -> Result<Vec<usize>> {
+    indices
+        .iter()
+        .map(|&local| {
+            item.incident
+                .get(local)
+                .copied()
+                .ok_or_else(|| anyhow!("local simplex index {local} out of range"))
+        })
+        .collect()
+}
+
+fn fill_simplex_adjacencies(items: &mut [VertexItem]) -> Result<()> {
+    let mut ridge_map: BTreeMap<Vec<usize>, Vec<RidgeOccurrence>> = BTreeMap::new();
+
+    for (k, item) in items.iter().enumerate() {
+        for (sidx, simplex) in item.simplices.iter().enumerate() {
+            let sigma = decoded_simplex_global_from_indices(item, &simplex.indices)
+                .with_context(|| format!("failed decoding item {k}, simplex {sidx}"))?;
+
+            for r in 0..sigma.len() {
+                let mut ridge = sigma.clone();
+                ridge.remove(r);
+
+                ridge_map.entry(ridge).or_default().push(RidgeOccurrence {
+                    item: k,
+                    simplex: sidx,
+                    missing_pos: r,
+                });
+            }
+        }
+    }
+
+    for item in items.iter_mut() {
+        for simplex in &mut item.simplices {
+            simplex.adj = vec![
+                AdjacentSimplex {
+                    item: usize::MAX,
+                    simplex: usize::MAX,
+                };
+                simplex.indices.len()
+            ];
+        }
+    }
+
+    for (ridge, occs) in ridge_map {
+        if occs.len() != 2 {
+            bail!(
+                "ridge {:?} is incident to {} simplices, expected exactly 2",
+                ridge,
+                occs.len()
+            );
+        }
+
+        let a = &occs[0];
+        let b = &occs[1];
+
+        items[a.item].simplices[a.simplex].adj[a.missing_pos] = AdjacentSimplex {
+            item: b.item,
+            simplex: b.simplex,
+        };
+        items[b.item].simplices[b.simplex].adj[b.missing_pos] = AdjacentSimplex {
+            item: a.item,
+            simplex: a.simplex,
+        };
+    }
+
+    Ok(())
 }
 
 pub fn choose_default_k0(items: &[VertexItem]) -> Result<usize> {
@@ -367,6 +450,7 @@ pub fn decode_simplex_global(item: &VertexItem, simplex_index: usize) -> Result<
         .ok_or_else(|| anyhow!("invalid simplex index {simplex_index}"))?;
 
     simplex
+        .indices
         .iter()
         .map(|&local| {
             item.incident
