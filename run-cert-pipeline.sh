@@ -3,7 +3,7 @@ set -euo pipefail
 
 DATA_DIR="${DATA_DIR:-data}"
 
-LRS_DIR="${LRS_DIR:-/home/labcmap/allamigeon/lrslib-073a}"
+LRS_DIR="${LRS_DIR:-../lrslib-073a}"
 LRSGMP="${LRSGMP:-$LRS_DIR/lrsgmp}"
 TIME_CMD="${TIME_CMD:-/usr/bin/time}"
 
