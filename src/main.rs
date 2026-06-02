@@ -229,9 +229,8 @@ fn run_postprocess(args: PostprocessArgs) -> Result<()> {
         None => choose_default_k0(&items)?,
     };
 
-    let root = Some(root_certificate(&h, &items, k0).context("failed to build root certificate")?);
-
-    let cert = to_certificate(items, root);
+    let root = root_certificate(&h, &items, k0).context("failed to build root certificate")?;
+    let cert = to_certificate(&h, items, root);
 
     if args.bin {
         let stdout = io::stdout();

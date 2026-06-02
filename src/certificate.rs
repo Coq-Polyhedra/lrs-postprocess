@@ -4,35 +4,61 @@ use std::fs;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Certificate {
+    /// Inequalities A x <= b used by the certificate.
+    pub inequalities: Vec<Inequality>,
+
     pub items: Vec<VertexItem>,
-    pub root: Option<Root>,
+    pub graph: SimplexGraph,
+    pub root: Root,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Inequality {
+    /// Coefficients of a_i.
+    pub a: Vec<String>,
+
+    /// Right-hand side b_i.
+    pub b: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct VertexItem {
     pub vertex: Vec<String>,
     pub incident: Vec<usize>,
-    pub simplices: Vec<Simplex>,
+    pub simplices: Vec<ItemSimplex>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Simplex {
-    /// Local indices into the corresponding VertexItem.incident list.
+pub struct ItemSimplex {
+    /// Local indices into `incident`.
     pub indices: Vec<usize>,
 
-    /// Adjacency pointers.  If indices has length d, then adj has length d.
-    /// The entry adj[i] points to the simplex adjacent through the ridge
-    /// obtained by deleting indices[i].
-    pub adj: Vec<AdjacentSimplex>,
+    /// Node of the global simplex adjacency graph.
+    pub node: usize,
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
-pub struct AdjacentSimplex {
-    /// Index of the adjacent vertex item.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LocalSimplexRef {
     pub item: usize,
-
-    /// Index of the adjacent simplex inside items[item].simplices.
     pub simplex: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GraphLabel {
+    /// Global row indices of the simplex. This list must be sorted and have length d.
+    pub simplex: Vec<usize>,
+
+    /// Inverse map from this graph node to the corresponding local simplex.
+    pub owner: LocalSimplexRef,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SimplexGraph {
+    /// Directed adjacency lists. The checker verifies that the directed graph is symmetric.
+    pub g: Vec<Vec<usize>>,
+
+    /// Labels of graph nodes. Each entry contains the global simplex and its local owner.
+    pub lbl: Vec<GraphLabel>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

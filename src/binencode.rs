@@ -6,7 +6,7 @@ use std::fs::File;
 use std::io::{BufWriter, Write};
 use std::path::Path;
 
-use crate::certificate::{read_certificate, AdjacentSimplex, Certificate, Root, Simplex, VertexItem};
+use crate::certificate::{read_certificate, Certificate, GraphLabel, Inequality, ItemSimplex, LocalSimplexRef, Root, SimplexGraph, VertexItem};
 
 #[derive(Clone, Debug)]
 enum Descr {
@@ -167,25 +167,37 @@ where
     Ok(())
 }
 
-fn adj_descr() -> Descr {
-    // adjacency pointer := item * simplex
+fn inequality_descr() -> Descr {
+    // inequality := a * b
+    pair(array(Descr::BigQ), Descr::BigQ)
+}
+
+fn local_simplex_ref_descr() -> Descr {
+    // local_simplex_ref := item * simplex
     pair(Descr::Int63, Descr::Int63)
 }
 
-fn simplex_descr() -> Descr {
-    // simplex := indices * adj
-    pair(array(Descr::Int63), array(adj_descr()))
+fn item_simplex_descr() -> Descr {
+    // item_simplex := indices * node
+    pair(array(Descr::Int63), Descr::Int63)
 }
 
 fn item_descr() -> Descr {
     // item := vertex * (incident * simplices)
     pair(
         array(Descr::BigQ),
-        pair(
-            array(Descr::Int63),
-            array(simplex_descr()),
-        ),
+        pair(array(Descr::Int63), array(item_simplex_descr())),
     )
+}
+
+fn graph_label_descr() -> Descr {
+    // graph_label := simplex * owner
+    pair(array(Descr::Int63), local_simplex_ref_descr())
+}
+
+fn graph_descr() -> Descr {
+    // graph := g * lbl
+    pair(array(array(Descr::Int63)), array(graph_label_descr()))
 }
 
 fn root_descr() -> Descr {
@@ -194,17 +206,17 @@ fn root_descr() -> Descr {
         Descr::Int63,
         pair(
             array(Descr::Int63),
-            pair(
-                array(array(Descr::BigQ)),
-                array(Descr::Int63),
-            ),
+            pair(array(array(Descr::BigQ)), array(Descr::Int63)),
         ),
     )
 }
 
 fn certificate_descr() -> Descr {
-    // certificate := items * roots
-    pair(array(item_descr()), array(root_descr()))
+    // certificate := inequalities * (items * (graph * root))
+    pair(
+        array(inequality_descr()),
+        pair(array(item_descr()), pair(graph_descr(), root_descr())),
+    )
 }
 
 fn write_usize_array<W: Write>(w: &mut W, xs: &[usize]) -> Result<()> {
@@ -220,34 +232,57 @@ fn write_bigq_string_matrix<W: Write>(w: &mut W, m: &[Vec<String>]) -> Result<()
     write_array(w, &row_descr, m, |w, row| write_bigq_string_array(w, row))
 }
 
-fn write_adj<W: Write>(w: &mut W, adj: &AdjacentSimplex) -> Result<()> {
-    write_int63_usize(w, adj.item)?;
-    write_int63_usize(w, adj.simplex)?;
+fn write_usize_matrix<W: Write>(w: &mut W, m: &[Vec<usize>]) -> Result<()> {
+    let row_descr = array(Descr::Int63);
+    write_array(w, &row_descr, m, |w, row| write_usize_array(w, row))
+}
+
+fn write_inequality<W: Write>(w: &mut W, ineq: &Inequality) -> Result<()> {
+    // inequality := a * b
+    write_bigq_string_array(w, &ineq.a)?;
+    write_bigq_str(w, &ineq.b)?;
     Ok(())
 }
 
-fn write_adj_array<W: Write>(w: &mut W, xs: &[AdjacentSimplex]) -> Result<()> {
-    let d = adj_descr();
-    write_array(w, &d, xs, |w, x| write_adj(w, x))
+fn write_local_simplex_ref<W: Write>(w: &mut W, r: &LocalSimplexRef) -> Result<()> {
+    // local_simplex_ref := item * simplex
+    write_int63_usize(w, r.item)?;
+    write_int63_usize(w, r.simplex)?;
+    Ok(())
 }
 
-fn write_simplex<W: Write>(w: &mut W, simplex: &Simplex) -> Result<()> {
-    // simplex := indices * adj
+fn write_item_simplex<W: Write>(w: &mut W, simplex: &ItemSimplex) -> Result<()> {
+    // item_simplex := indices * node
     write_usize_array(w, &simplex.indices)?;
-    write_adj_array(w, &simplex.adj)?;
+    write_int63_usize(w, simplex.node)?;
     Ok(())
-}
-
-fn write_simplex_array<W: Write>(w: &mut W, simplices: &[Simplex]) -> Result<()> {
-    let d = simplex_descr();
-    write_array(w, &d, simplices, |w, simplex| write_simplex(w, simplex))
 }
 
 fn write_item<W: Write>(w: &mut W, item: &VertexItem) -> Result<()> {
     // item := vertex * (incident * simplices)
     write_bigq_string_array(w, &item.vertex)?;
     write_usize_array(w, &item.incident)?;
-    write_simplex_array(w, &item.simplices)?;
+    let simplex_d = item_simplex_descr();
+    write_array(w, &simplex_d, &item.simplices, |w, simplex| {
+        write_item_simplex(w, simplex)
+    })?;
+    Ok(())
+}
+
+fn write_graph_label<W: Write>(w: &mut W, label: &GraphLabel) -> Result<()> {
+    // graph_label := simplex * owner
+    write_usize_array(w, &label.simplex)?;
+    write_local_simplex_ref(w, &label.owner)?;
+    Ok(())
+}
+
+fn write_graph<W: Write>(w: &mut W, graph: &SimplexGraph) -> Result<()> {
+    // graph := g * lbl
+    write_usize_matrix(w, &graph.g)?;
+
+    let label_d = graph_label_descr();
+    write_array(w, &label_d, &graph.lbl, |w, label| write_graph_label(w, label))?;
+
     Ok(())
 }
 
@@ -261,21 +296,17 @@ fn write_root<W: Write>(w: &mut W, root: &Root) -> Result<()> {
 }
 
 fn write_certificate_value<W: Write>(w: &mut W, cert: &Certificate) -> Result<()> {
+    let inequality_d = inequality_descr();
+    write_array(w, &inequality_d, &cert.inequalities, |w, ineq| {
+        write_inequality(w, ineq)
+    })?;
+
     let item_d = item_descr();
     write_array(w, &item_d, &cert.items, |w, item| write_item(w, item))?;
 
-    let root_d = root_descr();
-    match &cert.root {
-        None => {
-            let empty: Vec<Root> = Vec::new();
-            write_array(w, &root_d, &empty, |w, root| write_root(w, root))?;
-        }
-        Some(root) => {
-            write_array(w, &root_d, std::slice::from_ref(root), |w, root| {
-                write_root(w, root)
-            })?;
-        }
-    }
+    write_graph(w, &cert.graph)?;
+
+    write_root(w, &cert.root)?;
 
     Ok(())
 }

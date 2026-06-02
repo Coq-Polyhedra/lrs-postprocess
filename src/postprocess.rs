@@ -1,9 +1,9 @@
 use anyhow::{anyhow, bail, Context, Result};
 use num_traits::Zero;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs;
 
-use crate::certificate::{AdjacentSimplex, Certificate, Root, Simplex, VertexItem};
+use crate::certificate::{Certificate, GraphLabel, Inequality, ItemSimplex, LocalSimplexRef, Root, SimplexGraph, VertexItem};
 use crate::numerics::{dot, identity, invert_matrix, mat_mul, parse_q, q_to_string, Q};
 
 #[derive(Debug, Clone)]
@@ -286,7 +286,6 @@ pub fn parse_lrs_ext_records(path: &str, d: usize, m_ineq: usize) -> Result<Vec<
 pub fn build_items(records: Vec<LrsRecord>) -> Result<Vec<VertexItem>> {
     let mut items: Vec<VertexItem> = Vec::new();
     let mut vertex_to_id: BTreeMap<Vec<String>, usize> = BTreeMap::new();
-
     for rec in records {
         let mut incident = rec.cobasis.clone();
         incident.extend(rec.additional_incident.iter().copied());
@@ -319,7 +318,7 @@ pub fn build_items(records: Vec<LrsRecord>) -> Result<Vec<VertexItem>> {
             }
         };
 
-        let simplex = rec
+        let indices = rec
             .cobasis
             .iter()
             .map(|j| {
@@ -331,93 +330,78 @@ pub fn build_items(records: Vec<LrsRecord>) -> Result<Vec<VertexItem>> {
             })
             .collect::<Result<Vec<_>>>()?;
 
-        items[id].simplices.push(Simplex {
-            indices: simplex,
-            adj: Vec::new(),
+        items[id].simplices.push(ItemSimplex {
+            indices,
+            node: 0,
         });
     }
-
-    fill_simplex_adjacencies(&mut items).context("failed to build simplex adjacency pointers")?;
 
     Ok(items)
 }
 
+fn build_simplex_graph(items: &mut [VertexItem]) -> SimplexGraph {
+    let node_count = items.iter().map(|item| item.simplices.len()).sum::<usize>();
 
-#[derive(Debug, Clone)]
-struct RidgeOccurrence {
-    item: usize,
-    simplex: usize,
-    missing_pos: usize,
-}
+    let mut entries = Vec::<(Vec<usize>, usize, usize)>::with_capacity(node_count);
 
-fn decoded_simplex_global_from_indices(item: &VertexItem, indices: &[usize]) -> Result<Vec<usize>> {
-    indices
-        .iter()
-        .map(|&local| {
-            item.incident
-                .get(local)
-                .copied()
-                .ok_or_else(|| anyhow!("local simplex index {local} out of range"))
-        })
-        .collect()
-}
+    for (item_index, item) in items.iter().enumerate() {
+        for (simplex_index, simplex) in item.simplices.iter().enumerate() {
+            let rows = simplex
+                .indices
+                .iter()
+                .filter_map(|&local| item.incident.get(local).copied())
+                .collect::<Vec<_>>();
 
-fn fill_simplex_adjacencies(items: &mut [VertexItem]) -> Result<()> {
-    let mut ridge_map: BTreeMap<Vec<usize>, Vec<RidgeOccurrence>> = BTreeMap::new();
+            entries.push((rows, item_index, simplex_index));
+        }
+    }
 
-    for (k, item) in items.iter().enumerate() {
-        for (sidx, simplex) in item.simplices.iter().enumerate() {
-            let sigma = decoded_simplex_global_from_indices(item, &simplex.indices)
-                .with_context(|| format!("failed decoding item {k}, simplex {sidx}"))?;
+    // Canonicalize graph node numbering by lexicographic order of global labels.
+    entries.sort_by(|a, b| a.0.cmp(&b.0));
 
-            for r in 0..sigma.len() {
-                let mut ridge = sigma.clone();
-                ridge.remove(r);
+    let mut lbl = Vec::<GraphLabel>::with_capacity(node_count);
 
-                ridge_map.entry(ridge).or_default().push(RidgeOccurrence {
-                    item: k,
-                    simplex: sidx,
-                    missing_pos: r,
-                });
+    for (node, (rows, item_index, simplex_index)) in entries.into_iter().enumerate() {
+        items[item_index].simplices[simplex_index].node = node;
+        lbl.push(GraphLabel {
+            simplex: rows,
+            owner: LocalSimplexRef {
+                item: item_index,
+                simplex: simplex_index,
+            },
+        });
+    }
+
+    let mut ridge_map: HashMap<Vec<usize>, Vec<usize>> = HashMap::new();
+
+    for (node, label) in lbl.iter().enumerate() {
+        let sigma = &label.simplex;
+        for r in 0..sigma.len() {
+            let mut ridge = sigma.clone();
+            ridge.remove(r);
+            ridge_map.entry(ridge).or_default().push(node);
+        }
+    }
+
+    let mut g = vec![Vec::<usize>::new(); node_count];
+
+    for nodes in ridge_map.into_values() {
+        if nodes.len() == 2 {
+            let a = nodes[0];
+            let b = nodes[1];
+            if a < node_count && b < node_count && a != b {
+                g[a].push(b);
+                g[b].push(a);
             }
         }
     }
 
-    for item in items.iter_mut() {
-        for simplex in &mut item.simplices {
-            simplex.adj = vec![
-                AdjacentSimplex {
-                    item: usize::MAX,
-                    simplex: usize::MAX,
-                };
-                simplex.indices.len()
-            ];
-        }
+    for adj in &mut g {
+        adj.sort_unstable();
+        adj.dedup();
     }
 
-    for (ridge, occs) in ridge_map {
-        if occs.len() != 2 {
-            bail!(
-                "ridge {:?} is incident to {} simplices, expected exactly 2",
-                ridge,
-                occs.len()
-            );
-        }
-
-        let a = &occs[0];
-        let b = &occs[1];
-
-        items[a.item].simplices[a.simplex].adj[a.missing_pos] = AdjacentSimplex {
-            item: b.item,
-            simplex: b.simplex,
-        };
-        items[b.item].simplices[b.simplex].adj[b.missing_pos] = AdjacentSimplex {
-            item: a.item,
-            simplex: a.simplex,
-        };
-    }
-
-    Ok(())
+    SimplexGraph { g, lbl }
 }
 
 pub fn choose_default_k0(items: &[VertexItem]) -> Result<usize> {
@@ -515,6 +499,23 @@ pub fn root_certificate(h: &HRep, items: &[VertexItem], k0: usize) -> Result<Roo
     })
 }
 
-pub fn to_certificate(items: Vec<VertexItem>, root: Option<Root>) -> Certificate {
-    Certificate { items, root }
+fn certificate_inequalities(h: &HRep) -> Vec<Inequality> {
+    h.a.iter()
+        .zip(&h.b)
+        .map(|(a, b)| Inequality {
+            a: a.iter().map(q_to_string).collect(),
+            b: q_to_string(b),
+        })
+        .collect()
+}
+
+pub fn to_certificate(h: &HRep, mut items: Vec<VertexItem>, root: Root) -> Certificate {
+    let inequalities = certificate_inequalities(h);
+    let graph = build_simplex_graph(&mut items);
+    Certificate {
+        inequalities,
+        items,
+        graph,
+        root,
+    }
 }
