@@ -5,9 +5,10 @@ DATA_DIR="${DATA_DIR:-data}"
 
 LRS_DIR="${LRS_DIR:-/home/labcmap/allamigeon/lrslib-073a}"
 LRSGMP="${LRSGMP:-$LRS_DIR/lrsgmp}"
+TIME_CMD="${TIME_CMD:-/usr/bin/time}"
 
 # Build once with:
-#   ./run.sh build
+#   ./run-cert-pipeline.sh build
 #
 # Then timed runs use the compiled binary directly, so cargo build/startup
 # is not included in the measured time.
@@ -20,60 +21,156 @@ CHECKER="${CHECKER:-$BIN check}"
 COQC="${COQC:-coqc}"
 COQ_TEMPLATE="${COQ_TEMPLATE:-coq/InspectCertificate.v.template}"
 COQ_DIR="${COQ_DIR:-${DATA_DIR}/coq}"
+LAST_ELAPSED=""
 
-now_ms() {
-    date +%s%3N
+format_elapsed_seconds() {
+    local seconds="$1"
+
+    if [[ -z "$seconds" ]]; then
+        printf "unknown"
+    else
+        awk -v t="$seconds" 'BEGIN { printf "%.3f s", t }'
+    fi
 }
 
-format_ms() {
-    local ms="$1"
+format_ratio() {
+    local elapsed="$1"
+    local reference="$2"
 
-    local s=$((ms / 1000))
-    local rem_ms=$((ms % 1000))
+    if [[ -z "$elapsed" || -z "$reference" ]]; then
+        printf "unknown"
+        return
+    fi
 
-    printf "%d.%03d s" "$s" "$rem_ms"
+    awk -v t="$elapsed" -v r="$reference" 'BEGIN {
+        if (r <= 0) printf "unknown";
+        else printf "%.3fx lrs", t / r;
+    }'
 }
 
+read_lrs_elapsed() {
+    local base="$1"
+    local time_file="${DATA_DIR}/${base}-lrs.time"
+
+    if [[ -f "$time_file" ]]; then
+        cat "$time_file"
+    else
+        printf ""
+    fi
+}
+
+write_lrs_elapsed() {
+    local base="$1"
+    local elapsed="$2"
+    local time_file="${DATA_DIR}/${base}-lrs.time"
+
+    printf "%s\n" "$elapsed" > "$time_file"
+}
+
+check_time_command() {
+    if [[ ! -x "$TIME_CMD" ]]; then
+        echo "error: time command not found or not executable: $TIME_CMD" >&2
+        echo "hint: set TIME_CMD to a GNU time-compatible executable" >&2
+        exit 1
+    fi
+}
+
+# Timed command whose stdout/stderr both go to the log file.
+# Arguments:
+#   run_timed NAME LOG_FILE REFERENCE_SECONDS COMMAND...
+# If REFERENCE_SECONDS is nonempty, the report includes the ratio to lrs time.
 run_timed() {
     local name="$1"
     local log_file="$2"
-    shift 2
+    local reference_seconds="$3"
+    shift 3
+
+    check_time_command
 
     echo
     echo "=== $name ==="
 
-    local start end elapsed
-    start=$(now_ms)
+    local time_file status elapsed ratio
+    time_file="$(mktemp)"
 
-    "$@" > "$log_file" 2>&1
+    if "$TIME_CMD" -f "%e" -o "$time_file" "$@" > "$log_file" 2>&1; then
+        status=0
+    else
+        status=$?
+    fi
 
-    end=$(now_ms)
-    elapsed=$((end - start))
+    elapsed="$(cat "$time_file" 2>/dev/null || true)"
+    rm -f "$time_file"
 
-    echo "--- $name completed in $(format_ms "$elapsed") ---"
+    ratio="$(format_ratio "$elapsed" "$reference_seconds")"
+
+    if [[ "$status" -eq 0 ]]; then
+        if [[ -n "$reference_seconds" ]]; then
+            echo "--- $name completed in $(format_elapsed_seconds "$elapsed") (${ratio}) ---"
+        else
+            echo "--- $name completed in $(format_elapsed_seconds "$elapsed") ---"
+        fi
+    else
+        if [[ -n "$reference_seconds" ]]; then
+            echo "--- $name failed after $(format_elapsed_seconds "$elapsed") (${ratio}) ---"
+        else
+            echo "--- $name failed after $(format_elapsed_seconds "$elapsed") ---"
+        fi
+    fi
     echo "log: $log_file"
+
+    LAST_ELAPSED="$elapsed"
+    return "$status"
 }
 
+# Timed command whose stdout is an output file and stderr is a log file.
+# Arguments:
+#   run_timed_stdout_to_file NAME OUT_FILE LOG_FILE REFERENCE_SECONDS COMMAND...
+# If REFERENCE_SECONDS is nonempty, the report includes the ratio to lrs time.
 run_timed_stdout_to_file() {
     local name="$1"
     local out_file="$2"
     local log_file="$3"
-    shift 3
+    local reference_seconds="$4"
+    shift 4
+
+    check_time_command
 
     echo
     echo "=== $name ==="
 
-    local start end elapsed
-    start=$(now_ms)
+    local time_file status elapsed ratio
+    time_file="$(mktemp)"
 
-    "$@" > "$out_file" 2> "$log_file"
+    if "$TIME_CMD" -f "%e" -o "$time_file" "$@" > "$out_file" 2> "$log_file"; then
+        status=0
+    else
+        status=$?
+    fi
 
-    end=$(now_ms)
-    elapsed=$((end - start))
+    elapsed="$(cat "$time_file" 2>/dev/null || true)"
+    rm -f "$time_file"
 
-    echo "--- $name completed in $(format_ms "$elapsed") ---"
+    ratio="$(format_ratio "$elapsed" "$reference_seconds")"
+
+    if [[ "$status" -eq 0 ]]; then
+        if [[ -n "$reference_seconds" ]]; then
+            echo "--- $name completed in $(format_elapsed_seconds "$elapsed") (${ratio}) ---"
+        else
+            echo "--- $name completed in $(format_elapsed_seconds "$elapsed") ---"
+        fi
+    else
+        if [[ -n "$reference_seconds" ]]; then
+            echo "--- $name failed after $(format_elapsed_seconds "$elapsed") (${ratio}) ---"
+        else
+            echo "--- $name failed after $(format_elapsed_seconds "$elapsed") ---"
+        fi
+    fi
     echo "output: $out_file"
     echo "log: $log_file"
+
+    LAST_ELAPSED="$elapsed"
+    return "$status"
 }
 
 build_tools() {
@@ -107,8 +204,12 @@ compute_ext() {
         exit 1
     fi
 
-    run_timed "compute ext for $base" "$log_file" \
+    # lrs is the reference step, so its ratio is 1.000x lrs.
+    run_timed "compute ext for $base" "$log_file" "" \
         "$LRSGMP" "$ine_file" "$ext_file"
+
+    write_lrs_elapsed "$base" "$LAST_ELAPSED"
+    echo "reference lrs time: $(format_elapsed_seconds "$LAST_ELAPSED") (1.000x lrs)"
 }
 
 generate_certificate() {
@@ -117,6 +218,8 @@ generate_certificate() {
     local ext_file="${DATA_DIR}/${base}.ext"
     local cert_file="${DATA_DIR}/${base}-cert.json"
     local log_file="${DATA_DIR}/${base}-cert.log"
+    local lrs_elapsed
+    lrs_elapsed="$(read_lrs_elapsed "$base")"
 
     check_binary
 
@@ -130,7 +233,11 @@ generate_certificate() {
         exit 1
     fi
 
-    run_timed_stdout_to_file "generate certificate for $base" "$cert_file" "$log_file" \
+    if [[ -z "$lrs_elapsed" ]]; then
+        echo "warning: missing lrs time for $base; run '$0 ext $base' first for ratios" >&2
+    fi
+
+    run_timed_stdout_to_file "generate certificate for $base" "$cert_file" "$log_file" "$lrs_elapsed" \
         $CERT_GEN \
         "$ine_file" \
         "$ext_file"
@@ -142,6 +249,8 @@ generate_binary_certificate() {
     local ext_file="${DATA_DIR}/${base}.ext"
     local bin_file="${DATA_DIR}/${base}-cert.bin"
     local log_file="${DATA_DIR}/${base}-bin.log"
+    local lrs_elapsed
+    lrs_elapsed="$(read_lrs_elapsed "$base")"
 
     check_binary
 
@@ -155,7 +264,11 @@ generate_binary_certificate() {
         exit 1
     fi
 
-    run_timed_stdout_to_file "generate binary certificate for $base" "$bin_file" "$log_file" \
+    if [[ -z "$lrs_elapsed" ]]; then
+        echo "warning: missing lrs time for $base; run '$0 ext $base' first for ratios" >&2
+    fi
+
+    run_timed_stdout_to_file "generate binary certificate for $base" "$bin_file" "$log_file" "$lrs_elapsed" \
         $BIN_CERT_GEN \
         "$ine_file" \
         "$ext_file"
@@ -166,6 +279,8 @@ run_checker() {
     local ine_file="${DATA_DIR}/${base}.ine"
     local cert_file="${DATA_DIR}/${base}-cert.json"
     local log_file="${DATA_DIR}/${base}-check.log"
+    local lrs_elapsed
+    lrs_elapsed="$(read_lrs_elapsed "$base")"
 
     check_binary
 
@@ -179,7 +294,11 @@ run_checker() {
         exit 1
     fi
 
-    run_timed "check certificate for $base" "$log_file" \
+    if [[ -z "$lrs_elapsed" ]]; then
+        echo "warning: missing lrs time for $base; run '$0 ext $base' first for ratios" >&2
+    fi
+
+    run_timed "check certificate for $base" "$log_file" "$lrs_elapsed" \
         $CHECKER \
         "$ine_file" \
         "$cert_file"
@@ -195,6 +314,8 @@ run_coq_binreader_test() {
     local v_file="${COQ_DIR}/${coq_base}_inspect.v"
 
     local log_file="${DATA_DIR}/${base}-coq.log"
+    local lrs_elapsed
+    lrs_elapsed="$(read_lrs_elapsed "$base")"
 
     if [[ ! -f "$bin_file" ]]; then
         echo "error: binary certificate not found: $bin_file" >&2
@@ -207,6 +328,10 @@ run_coq_binreader_test() {
         exit 1
     fi
 
+    if [[ -z "$lrs_elapsed" ]]; then
+        echo "warning: missing lrs time for $base; run '$0 ext $base' first for ratios" >&2
+    fi
+
     mkdir -p "$COQ_DIR"
 
     local abs_bin_file
@@ -214,7 +339,7 @@ run_coq_binreader_test() {
 
     sed "s|__BIN_FILE__|${abs_bin_file}|g" "$COQ_TEMPLATE" > "$v_file"
 
-    run_timed "Coq/binreader test for $base" "$log_file" \
+    run_timed "Coq/binreader test for $base" "$log_file" "$lrs_elapsed" \
         "$COQC" "$v_file"
 }
 
@@ -224,6 +349,7 @@ clean_generated() {
     local ext_file="${DATA_DIR}/${base}.ext"
     local cert_file="${DATA_DIR}/${base}-cert.json"
     local bin_file="${DATA_DIR}/${base}-cert.bin"
+    local lrs_time_file="${DATA_DIR}/${base}-lrs.time"
 
     local ext_log="${DATA_DIR}/${base}-ext.log"
     local cert_log="${DATA_DIR}/${base}-cert.log"
@@ -241,6 +367,7 @@ clean_generated() {
         "$ext_file" \
         "$cert_file" \
         "$bin_file" \
+        "$lrs_time_file" \
         "$ext_log" \
         "$cert_log" \
         "$bin_log" \
@@ -305,6 +432,7 @@ For each BASE, the script uses:
   ${DATA_DIR}/BASE.ext
   ${DATA_DIR}/BASE-cert.json
   ${DATA_DIR}/BASE-cert.bin
+  ${DATA_DIR}/BASE-lrs.time
 
 Generated logs:
   ${DATA_DIR}/BASE-ext.log
@@ -327,10 +455,16 @@ Examples:
   $0 coq cross_9
   $0 clean cross_9 cross_10
 
+Timing:
+  The ext step, i.e. lrsgmp, is used as the reference lrs time.
+  Other steps report both seconds and the ratio to that lrs time.
+  The reference is stored in ${DATA_DIR}/BASE-lrs.time.
+
 Environment variables:
   DATA_DIR       directory containing input/output files, default: data
   LRS_DIR        directory containing lrsgmp
   LRSGMP         full path to lrsgmp
+  TIME_CMD       GNU time-compatible command, default: /usr/bin/time
   BIN            compiled Rust binary, default: ./target/release/lrs-postprocess
   CERT_GEN       JSON certificate command, default: "\$BIN postprocess --pretty"
   BIN_CERT_GEN   binary certificate command, default: "\$BIN postprocess --bin"
