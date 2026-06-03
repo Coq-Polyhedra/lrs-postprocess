@@ -14,16 +14,27 @@ pub struct Certificate {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Inequality {
-    /// Coefficients of a_i.
+    /// Integer coefficients of a_i after clearing denominators in this row.
     pub a: Vec<String>,
 
-    /// Right-hand side b_i.
+    /// Integer right-hand side b_i after clearing denominators in this row.
     pub b: String,
+}
+
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
+pub struct VertexCoords {
+    /// Integer numerators after clearing denominators.
+    pub num: Vec<String>,
+
+    /// Common positive denominator.
+    pub den: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct VertexItem {
-    pub vertex: Vec<String>,
+    /// Vertex coordinates represented as num / den, componentwise.
+    pub vertex: VertexCoords,
     pub incident: Vec<usize>,
     pub simplices: Vec<ItemSimplex>,
 }

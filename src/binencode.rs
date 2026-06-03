@@ -6,7 +6,7 @@ use std::fs::File;
 use std::io::{BufWriter, Write};
 use std::path::Path;
 
-use crate::certificate::{read_certificate, Certificate, GraphLabel, Inequality, ItemSimplex, LocalSimplexRef, Root, SimplexGraph, VertexItem};
+use crate::certificate::{read_certificate, Certificate, GraphLabel, Inequality, ItemSimplex, LocalSimplexRef, Root, SimplexGraph, VertexCoords, VertexItem};
 
 #[derive(Clone, Debug)]
 enum Descr {
@@ -168,8 +168,8 @@ where
 }
 
 fn inequality_descr() -> Descr {
-    // inequality := a * b
-    pair(array(Descr::BigQ), Descr::BigQ)
+    // inequality := integer coefficients * integer rhs
+    pair(array(Descr::BigZ), Descr::BigZ)
 }
 
 fn local_simplex_ref_descr() -> Descr {
@@ -182,10 +182,15 @@ fn item_simplex_descr() -> Descr {
     pair(array(Descr::Int63), Descr::Int63)
 }
 
+fn vertex_coords_descr() -> Descr {
+    // vertex := integer numerators * common denominator
+    pair(array(Descr::BigZ), Descr::BigZ)
+}
+
 fn item_descr() -> Descr {
     // item := vertex * (incident * simplices)
     pair(
-        array(Descr::BigQ),
+        vertex_coords_descr(),
         pair(array(Descr::Int63), array(item_simplex_descr())),
     )
 }
@@ -238,9 +243,9 @@ fn write_usize_matrix<W: Write>(w: &mut W, m: &[Vec<usize>]) -> Result<()> {
 }
 
 fn write_inequality<W: Write>(w: &mut W, ineq: &Inequality) -> Result<()> {
-    // inequality := a * b
-    write_bigq_string_array(w, &ineq.a)?;
-    write_bigq_str(w, &ineq.b)?;
+    // inequality := integer coefficients * integer rhs
+    write_bigz_string_array(w, &ineq.a)?;
+    write_bigz_str(w, &ineq.b)?;
     Ok(())
 }
 
@@ -258,9 +263,27 @@ fn write_item_simplex<W: Write>(w: &mut W, simplex: &ItemSimplex) -> Result<()> 
     Ok(())
 }
 
+
+fn write_bigz_str<W: Write>(w: &mut W, s: &str) -> Result<()> {
+    let z = BigInt::parse_bytes(s.trim().as_bytes(), 10)
+        .ok_or_else(|| anyhow::anyhow!("invalid integer `{}`", s.trim()))?;
+    write_bigz(w, &z)
+}
+
+fn write_bigz_string_array<W: Write>(w: &mut W, xs: &[String]) -> Result<()> {
+    write_array(w, &Descr::BigZ, xs, |w, x| write_bigz_str(w, x))
+}
+
+fn write_vertex_coords<W: Write>(w: &mut W, vertex: &VertexCoords) -> Result<()> {
+    // vertex := integer numerators * common denominator
+    write_bigz_string_array(w, &vertex.num)?;
+    write_bigz_str(w, &vertex.den)?;
+    Ok(())
+}
+
 fn write_item<W: Write>(w: &mut W, item: &VertexItem) -> Result<()> {
     // item := vertex * (incident * simplices)
-    write_bigq_string_array(w, &item.vertex)?;
+    write_vertex_coords(w, &item.vertex)?;
     write_usize_array(w, &item.incident)?;
     let simplex_d = item_simplex_descr();
     write_array(w, &simplex_d, &item.simplices, |w, simplex| {

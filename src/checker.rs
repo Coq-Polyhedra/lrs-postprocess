@@ -1,9 +1,38 @@
 use anyhow::{anyhow, bail, Context, Result};
-use num_traits::{One, Zero};
+use num_bigint::{BigInt, Sign};
+use num_integer::Integer;
+use num_traits::{One, Signed, Zero};
 
-use crate::certificate::{read_certificate, Certificate, LocalSimplexRef, Root, VertexItem};
-use crate::numerics::{dot, mat_mul, parse_q, Q};
+use crate::certificate::{read_certificate, Certificate, LocalSimplexRef, Root, VertexCoords, VertexItem};
+use crate::numerics::{dot, mat_mul, parse_q, q_to_string, Q};
 use crate::postprocess::{parse_lrs_hrep, HRep};
+
+
+fn parse_bigint_decimal(s: &str, what: &str) -> Result<BigInt> {
+    BigInt::parse_bytes(s.trim().as_bytes(), 10)
+        .ok_or_else(|| anyhow!("invalid integer `{}` for {what}", s.trim()))
+}
+
+fn check_vertex_coords(v: &VertexCoords, expected_dim: usize, what: &str) -> Result<()> {
+    if v.num.len() != expected_dim {
+        bail!(
+            "{what}: vertex numerator vector has dimension {}, expected {}",
+            v.num.len(),
+            expected_dim
+        );
+    }
+
+    for (i, x) in v.num.iter().enumerate() {
+        let _ = parse_bigint_decimal(x, &format!("{what}: vertex numerator {i}"))?;
+    }
+
+    let den = parse_bigint_decimal(&v.den, &format!("{what}: vertex denominator"))?;
+    if den.sign() != Sign::Plus {
+        bail!("{what}: vertex denominator must be positive, got {}", v.den);
+    }
+
+    Ok(())
+}
 
 fn parse_q_vec(v: &[String]) -> Result<Vec<Q>> {
     v.iter().map(|s| parse_q(s)).collect()
@@ -11,6 +40,73 @@ fn parse_q_vec(v: &[String]) -> Result<Vec<Q>> {
 
 fn parse_q_matrix(m: &[Vec<String>]) -> Result<Vec<Vec<Q>>> {
     m.iter().map(|row| parse_q_vec(row)).collect()
+}
+
+fn parse_rational_parts(s: &str) -> Result<(BigInt, BigInt)> {
+    let s = s.trim();
+
+    let (mut num, mut den) = if let Some((a, b)) = s.split_once('/') {
+        let num = BigInt::parse_bytes(a.trim().as_bytes(), 10)
+            .ok_or_else(|| anyhow!("invalid rational numerator `{}`", a.trim()))?;
+        let den = BigInt::parse_bytes(b.trim().as_bytes(), 10)
+            .ok_or_else(|| anyhow!("invalid rational denominator `{}`", b.trim()))?;
+        (num, den)
+    } else {
+        let num = BigInt::parse_bytes(s.as_bytes(), 10)
+            .ok_or_else(|| anyhow!("invalid integer rational `{s}`"))?;
+        (num, BigInt::one())
+    };
+
+    if den.is_zero() {
+        bail!("invalid rational `{s}` with zero denominator");
+    }
+
+    if den.sign() == Sign::Minus {
+        num = -num;
+        den = -den;
+    }
+
+    let g = num.abs().gcd(&den);
+    num /= &g;
+    den /= &g;
+
+    Ok((num, den))
+}
+
+fn clear_rationals_to_integer_row(values: &[String]) -> Result<Vec<BigInt>> {
+    let mut nums = Vec::<BigInt>::with_capacity(values.len());
+    let mut dens = Vec::<BigInt>::with_capacity(values.len());
+
+    for s in values {
+        let (num, den) = parse_rational_parts(s)
+            .with_context(|| format!("failed to parse rational `{s}` while clearing denominators"))?;
+        nums.push(num);
+        dens.push(den);
+    }
+
+    let lcm = dens.iter().fold(BigInt::one(), |acc, den| acc.lcm(den));
+
+    Ok(nums
+        .iter()
+        .zip(&dens)
+        .map(|(num, den)| num * (&lcm / den))
+        .collect())
+}
+
+fn integer_inequality_from_hrep(h: &HRep, i: usize) -> Result<(Vec<BigInt>, BigInt)> {
+    let mut values = h.a[i]
+        .iter()
+        .map(q_to_string)
+        .collect::<Vec<_>>();
+    values.push(q_to_string(&h.b[i]));
+
+    let cleared = clear_rationals_to_integer_row(&values)?;
+    let b = cleared
+        .last()
+        .cloned()
+        .ok_or_else(|| anyhow!("empty inequality row after clearing denominators"))?;
+    let a = cleared[..cleared.len() - 1].to_vec();
+    Ok((a, b))
 }
 
 fn identity(n: usize) -> Vec<Vec<Q>> {
@@ -115,28 +211,34 @@ fn check_certificate_inequalities(h: &HRep, cert: &Certificate) -> Result<()> {
     }
 
     for (i, ineq) in cert.inequalities.iter().enumerate() {
-        let a = parse_q_vec(&ineq.a)
-            .with_context(|| format!("failed to parse certificate inequality {i} coefficients"))?;
-        let b = parse_q(&ineq.b)
-            .with_context(|| format!("failed to parse certificate inequality {i} rhs"))?;
-
-        if a.len() != h.d {
+        if ineq.a.len() != h.d {
             bail!(
                 "certificate inequality {i} has {} coefficients, expected d={}",
-                a.len(),
+                ineq.a.len(),
                 h.d
             );
         }
 
-        if a != h.a[i] {
+        let a = ineq
+            .a
+            .iter()
+            .enumerate()
+            .map(|(j, s)| parse_bigint_decimal(s, &format!("inequality {i} coefficient {j}")))
+            .collect::<Result<Vec<_>>>()?;
+        let b = parse_bigint_decimal(&ineq.b, &format!("inequality {i} rhs"))?;
+
+        let (expected_a, expected_b) = integer_inequality_from_hrep(h, i)
+            .with_context(|| format!("failed to clear input inequality {i}"))?;
+
+        if a != expected_a {
             bail!(
-                "certificate inequality {i} coefficients do not match input H-representation"
+                "certificate inequality {i} integer coefficients do not match input H-representation after clearing denominators"
             );
         }
 
-        if b != h.b[i] {
+        if b != expected_b {
             bail!(
-                "certificate inequality {i} rhs does not match input H-representation"
+                "certificate inequality {i} integer rhs does not match input H-representation after clearing denominators"
             );
         }
     }
@@ -146,16 +248,8 @@ fn check_certificate_inequalities(h: &HRep, cert: &Certificate) -> Result<()> {
 
 fn check_items_basic(h: &HRep, cert: &Certificate) -> Result<()> {
     for (k, item) in cert.items.iter().enumerate() {
-        if item.vertex.len() != h.d {
-            bail!(
-                "item {k}: vertex has dimension {}, expected {}",
-                item.vertex.len(),
-                h.d
-            );
-        }
-
-        let _x = parse_q_vec(&item.vertex)
-            .with_context(|| format!("item {k}: failed to parse vertex coordinates"))?;
+        check_vertex_coords(&item.vertex, h.d, &format!("item {k}"))
+            .with_context(|| format!("item {k}: invalid vertex coordinates"))?;
 
         strictly_sorted_len(&item.incident)
             .with_context(|| format!("item {k}: incident list is not strictly sorted"))?;

@@ -1,9 +1,11 @@
 use anyhow::{anyhow, bail, Context, Result};
-use num_traits::Zero;
+use num_bigint::{BigInt, Sign};
+use num_integer::Integer;
+use num_traits::{One, Signed, Zero};
 use std::collections::{BTreeMap, HashMap};
 use std::fs;
 
-use crate::certificate::{Certificate, GraphLabel, Inequality, ItemSimplex, LocalSimplexRef, Root, SimplexGraph, VertexItem};
+use crate::certificate::{Certificate, GraphLabel, Inequality, ItemSimplex, LocalSimplexRef, Root, SimplexGraph, VertexCoords, VertexItem};
 use crate::numerics::{dot, identity, invert_matrix, mat_mul, parse_q, q_to_string, Q};
 
 #[derive(Debug, Clone)]
@@ -26,6 +28,65 @@ pub struct LrsRecord {
     /// Additional incident inequalities after `:`.
     /// Converted to 0-based row indices.
     pub additional_incident: Vec<usize>,
+}
+
+
+fn parse_rational_parts(s: &str) -> Result<(BigInt, BigInt)> {
+    let s = s.trim();
+
+    let (mut num, mut den) = if let Some((a, b)) = s.split_once('/') {
+        let num = BigInt::parse_bytes(a.trim().as_bytes(), 10)
+            .ok_or_else(|| anyhow!("invalid rational numerator `{}`", a.trim()))?;
+        let den = BigInt::parse_bytes(b.trim().as_bytes(), 10)
+            .ok_or_else(|| anyhow!("invalid rational denominator `{}`", b.trim()))?;
+        (num, den)
+    } else {
+        let num = BigInt::parse_bytes(s.as_bytes(), 10)
+            .ok_or_else(|| anyhow!("invalid integer rational `{s}`"))?;
+        (num, BigInt::one())
+    };
+
+    if den.is_zero() {
+        bail!("invalid rational `{s}` with zero denominator");
+    }
+
+    if den.sign() == Sign::Minus {
+        num = -num;
+        den = -den;
+    }
+
+    let g = num.abs().gcd(&den);
+    num /= &g;
+    den /= &g;
+
+    Ok((num, den))
+}
+
+fn vertex_coords_from_strings(v: &[String]) -> Result<VertexCoords> {
+    let mut nums = Vec::<BigInt>::with_capacity(v.len());
+    let mut dens = Vec::<BigInt>::with_capacity(v.len());
+
+    for s in v {
+        let (num, den) = parse_rational_parts(s)
+            .with_context(|| format!("failed to parse vertex coordinate `{s}`"))?;
+        nums.push(num);
+        dens.push(den);
+    }
+
+    let lcm = dens
+        .iter()
+        .fold(BigInt::one(), |acc, den| acc.lcm(den));
+
+    let cleared = nums
+        .iter()
+        .zip(&dens)
+        .map(|(num, den)| (num * (&lcm / den)).to_string())
+        .collect();
+
+    Ok(VertexCoords {
+        num: cleared,
+        den: lcm.to_string(),
+    })
 }
 
 fn sorted_unique(mut v: Vec<usize>) -> Vec<usize> {
@@ -285,18 +346,20 @@ pub fn parse_lrs_ext_records(path: &str, d: usize, m_ineq: usize) -> Result<Vec<
 
 pub fn build_items(records: Vec<LrsRecord>) -> Result<Vec<VertexItem>> {
     let mut items: Vec<VertexItem> = Vec::new();
-    let mut vertex_to_id: BTreeMap<Vec<String>, usize> = BTreeMap::new();
+    let mut vertex_to_id: BTreeMap<VertexCoords, usize> = BTreeMap::new();
     for rec in records {
+        let vertex = vertex_coords_from_strings(&rec.vertex)?;
+
         let mut incident = rec.cobasis.clone();
         incident.extend(rec.additional_incident.iter().copied());
         incident = sorted_unique(incident);
 
-        let id = match vertex_to_id.get(&rec.vertex) {
+        let id = match vertex_to_id.get(&vertex) {
             Some(&id) => {
                 if items[id].incident != incident {
                     bail!(
                         "inconsistent incident list for vertex {:?}: first={:?}, new={:?}",
-                        rec.vertex,
+                        vertex,
                         items[id].incident,
                         incident
                     );
@@ -306,10 +369,10 @@ pub fn build_items(records: Vec<LrsRecord>) -> Result<Vec<VertexItem>> {
             None => {
                 let id = items.len();
 
-                vertex_to_id.insert(rec.vertex.clone(), id);
+                vertex_to_id.insert(vertex.clone(), id);
 
                 items.push(VertexItem {
-                    vertex: rec.vertex.clone(),
+                    vertex: vertex.clone(),
                     incident: incident.clone(),
                     simplices: Vec::new(),
                 });
@@ -499,23 +562,58 @@ pub fn root_certificate(h: &HRep, items: &[VertexItem], k0: usize) -> Result<Roo
     })
 }
 
-fn certificate_inequalities(h: &HRep) -> Vec<Inequality> {
+fn clear_rationals_to_integer_row(values: &[String]) -> Result<Vec<String>> {
+    let mut nums = Vec::<BigInt>::with_capacity(values.len());
+    let mut dens = Vec::<BigInt>::with_capacity(values.len());
+
+    for s in values {
+        let (num, den) = parse_rational_parts(s)
+            .with_context(|| format!("failed to parse rational `{s}` while clearing denominators"))?;
+        nums.push(num);
+        dens.push(den);
+    }
+
+    let lcm = dens.iter().fold(BigInt::one(), |acc, den| acc.lcm(den));
+
+    Ok(nums
+        .iter()
+        .zip(&dens)
+        .map(|(num, den)| (num * (&lcm / den)).to_string())
+        .collect())
+}
+
+fn integer_inequality_from_q_row(a: &[Q], b: &Q) -> Result<Inequality> {
+    let mut values = a.iter().map(q_to_string).collect::<Vec<_>>();
+    values.push(q_to_string(b));
+
+    let cleared = clear_rationals_to_integer_row(&values)?;
+    let rhs = cleared
+        .last()
+        .cloned()
+        .ok_or_else(|| anyhow!("empty inequality row after clearing denominators"))?;
+    let coeffs = cleared[..cleared.len() - 1].to_vec();
+
+    Ok(Inequality { a: coeffs, b: rhs })
+}
+
+fn certificate_inequalities(h: &HRep) -> Result<Vec<Inequality>> {
     h.a.iter()
         .zip(&h.b)
-        .map(|(a, b)| Inequality {
-            a: a.iter().map(q_to_string).collect(),
-            b: q_to_string(b),
+        .enumerate()
+        .map(|(i, (a, b))| {
+            integer_inequality_from_q_row(a, b)
+                .with_context(|| format!("failed to clear denominators of inequality {i}"))
         })
         .collect()
 }
 
-pub fn to_certificate(h: &HRep, mut items: Vec<VertexItem>, root: Root) -> Certificate {
-    let inequalities = certificate_inequalities(h);
+pub fn to_certificate(h: &HRep, mut items: Vec<VertexItem>, root: Root) -> Result<Certificate> {
+    let inequalities = certificate_inequalities(h)?;
     let graph = build_simplex_graph(&mut items);
-    Certificate {
+    Ok(Certificate {
         inequalities,
         items,
         graph,
         root,
-    }
+    })
 }
