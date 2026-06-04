@@ -184,7 +184,8 @@ fn item_simplex_descr() -> Descr {
 
 fn vertex_coords_descr() -> Descr {
     // vertex := integer numerators * common denominator
-    pair(array(Descr::BigZ), Descr::BigZ)
+    // The denominator is positive, hence encoded as BigN.
+    pair(array(Descr::BigZ), Descr::BigN)
 }
 
 fn item_descr() -> Descr {
@@ -270,14 +271,25 @@ fn write_bigz_str<W: Write>(w: &mut W, s: &str) -> Result<()> {
     write_bigz(w, &z)
 }
 
+fn write_bign_str<W: Write>(w: &mut W, s: &str) -> Result<()> {
+    let n = BigUint::parse_bytes(s.trim().as_bytes(), 10)
+        .ok_or_else(|| anyhow::anyhow!("invalid natural integer `{}`", s.trim()))?;
+
+    if n.is_zero() {
+        bail!("BigN denominator must be positive, got 0");
+    }
+
+    write_bign(w, &n)
+}
+
 fn write_bigz_string_array<W: Write>(w: &mut W, xs: &[String]) -> Result<()> {
     write_array(w, &Descr::BigZ, xs, |w, x| write_bigz_str(w, x))
 }
 
 fn write_vertex_coords<W: Write>(w: &mut W, vertex: &VertexCoords) -> Result<()> {
-    // vertex := integer numerators * common denominator
+    // vertex := integer numerators * common positive denominator
     write_bigz_string_array(w, &vertex.num)?;
-    write_bigz_str(w, &vertex.den)?;
+    write_bign_str(w, &vertex.den)?;
     Ok(())
 }
 

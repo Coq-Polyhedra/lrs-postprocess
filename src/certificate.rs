@@ -27,7 +27,7 @@ pub struct VertexCoords {
     /// Integer numerators after clearing denominators.
     pub num: Vec<String>,
 
-    /// Common positive denominator.
+    /// Common positive denominator, encoded as BigN in the binary format.
     pub den: String,
 }
 
