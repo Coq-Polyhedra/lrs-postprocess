@@ -33,9 +33,15 @@ pub struct VertexCoords {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct VertexItem {
+    /// Incident inequality indices.
+    ///
+    /// This field is intentionally first in the binary encoding of items.
+    /// The item array is sorted lexicographically by this list.
+    pub incident: Vec<usize>,
+
     /// Vertex coordinates represented as num / den, componentwise.
     pub vertex: VertexCoords,
-    pub incident: Vec<usize>,
+
     pub simplices: Vec<ItemSimplex>,
 }
 
@@ -65,7 +71,11 @@ pub struct GraphLabel {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SimplexGraph {
-    /// Directed adjacency lists. The checker verifies that the directed graph is symmetric.
+    /// Position-indexed directed adjacency lists.
+    ///
+    /// If `lbl[k].simplex = sigma`, then `g[k][j]` is the node adjacent
+    /// to `k` through the ridge `sigma \ {sigma[j]}`.
+    /// The checker verifies the reciprocal condition.
     pub g: Vec<Vec<usize>>,
 
     /// Labels of graph nodes. Each entry contains the global simplex and its local owner.

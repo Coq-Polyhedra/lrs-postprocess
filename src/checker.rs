@@ -291,6 +291,18 @@ fn check_items_basic(h: &HRep, cert: &Certificate) -> Result<()> {
         }
     }
 
+    for k in 1..cert.items.len() {
+        if cert.items[k - 1].incident >= cert.items[k].incident {
+            bail!(
+                "items are not strictly lexicographically sorted by incident sets at positions {} and {}: {:?} then {:?}",
+                k - 1,
+                k,
+                cert.items[k - 1].incident,
+                cert.items[k].incident
+            );
+        }
+    }
+
     Ok(())
 }
 
@@ -495,36 +507,26 @@ fn check_simplex_graph(h: &HRep, cert: &Certificate) -> Result<()> {
     let m = cert.graph.lbl.len();
 
     for (node, adj) in cert.graph.g.iter().enumerate() {
-        strictly_sorted_len(adj)
-            .with_context(|| format!("graph.g[{node}] is not strictly sorted"))?;
-
         if adj.len() != h.d {
             bail!(
-                "graph.g[{node}] has length {}, expected d={} (one neighbor per ridge)",
+                "graph.g[{node}] has length {}, expected d={} (one neighbor per ridge position)",
                 adj.len(),
                 h.d
             );
         }
 
         let sigma = &cert.graph.lbl[node].simplex;
-        let mut seen_missing_positions = vec![false; h.d];
 
-        for (apos, &other) in adj.iter().enumerate() {
+        for (r, &other) in adj.iter().enumerate() {
             if other >= m {
                 bail!(
-                    "graph.g[{node}][{apos}]={other} out of range 0..{}",
+                    "graph.g[{node}][{r}]={other} out of range 0..{}",
                     m
                 );
             }
 
             if other == node {
-                bail!("graph.g[{node}] contains a self-loop");
-            }
-
-            if !contains_sorted(&cert.graph.g[other], node) {
-                bail!(
-                    "directed graph is not symmetric: {node} lists {other}, but {other} does not list {node}"
-                );
+                bail!("graph.g[{node}][{r}] is a self-loop");
             }
 
             let other_sigma = &cert.graph.lbl[other].simplex;
@@ -533,16 +535,32 @@ fn check_simplex_graph(h: &HRep, cert: &Certificate) -> Result<()> {
                 format!("graph edge {node}->{other} is not a ridge adjacency")
             })?;
 
-            let _missing_from_other = diff_pos(other_sigma, sigma).with_context(|| {
+            if missing_from_node != r {
+                bail!(
+                    "graph.g[{node}][{r}]={other} does not correspond to deleting position {r}; \
+                     the unique element of graph.lbl[{node}] missing from graph.lbl[{other}] is at position {missing_from_node}"
+                );
+            }
+
+            let missing_from_other = diff_pos(other_sigma, sigma).with_context(|| {
                 format!("graph edge {other}->{node} is not a ridge adjacency")
             })?;
 
-            if seen_missing_positions[missing_from_node] {
+            if cert.graph.g[other].len() != h.d {
                 bail!(
-                    "graph.g[{node}] has two neighbors through the same ridge position {missing_from_node}"
+                    "graph.g[{other}] has length {}, expected d={} (one neighbor per ridge position)",
+                    cert.graph.g[other].len(),
+                    h.d
                 );
             }
-            seen_missing_positions[missing_from_node] = true;
+
+            if cert.graph.g[other][missing_from_other] != node {
+                bail!(
+                    "graph adjacency is not reciprocal through the corresponding ridge: \
+                     graph.g[{node}][{r}]={other}, but graph.g[{other}][{missing_from_other}]={}",
+                    cert.graph.g[other][missing_from_other]
+                );
+            }
         }
     }
 

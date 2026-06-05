@@ -372,8 +372,8 @@ pub fn build_items(records: Vec<LrsRecord>) -> Result<Vec<VertexItem>> {
                 vertex_to_id.insert(vertex.clone(), id);
 
                 items.push(VertexItem {
-                    vertex: vertex.clone(),
                     incident: incident.clone(),
+                    vertex: vertex.clone(),
                     simplices: Vec::new(),
                 });
 
@@ -399,10 +399,15 @@ pub fn build_items(records: Vec<LrsRecord>) -> Result<Vec<VertexItem>> {
         });
     }
 
+    // Canonicalize item ordering for the certificate: items are sorted
+    // lexicographically by their incident inequality lists. This makes the
+    // Coq-side item array searchable by its first component.
+    items.sort_by(|a, b| a.incident.cmp(&b.incident));
+
     Ok(items)
 }
 
-fn build_simplex_graph(items: &mut [VertexItem]) -> SimplexGraph {
+fn build_simplex_graph(items: &mut [VertexItem]) -> Result<SimplexGraph> {
     let node_count = items.iter().map(|item| item.simplices.len()).sum::<usize>();
 
     let mut entries = Vec::<(Vec<usize>, usize, usize)>::with_capacity(node_count);
@@ -412,8 +417,17 @@ fn build_simplex_graph(items: &mut [VertexItem]) -> SimplexGraph {
             let rows = simplex
                 .indices
                 .iter()
-                .filter_map(|&local| item.incident.get(local).copied())
-                .collect::<Vec<_>>();
+                .map(|&local| {
+                    item.incident
+                        .get(local)
+                        .copied()
+                        .ok_or_else(|| {
+                            anyhow!(
+                                "item {item_index}, simplex {simplex_index}: local index {local} out of range"
+                            )
+                        })
+                })
+                .collect::<Result<Vec<_>>>()?;
 
             entries.push((rows, item_index, simplex_index));
         }
@@ -435,36 +449,56 @@ fn build_simplex_graph(items: &mut [VertexItem]) -> SimplexGraph {
         });
     }
 
-    let mut ridge_map: HashMap<Vec<usize>, Vec<usize>> = HashMap::new();
+    // For every ridge occurrence (node, r), store the unique adjacent node
+    // through the ridge obtained by deleting lbl[node].simplex[r].
+    let mut ridge_map: HashMap<Vec<usize>, Vec<(usize, usize)>> = HashMap::new();
 
     for (node, label) in lbl.iter().enumerate() {
         let sigma = &label.simplex;
         for r in 0..sigma.len() {
             let mut ridge = sigma.clone();
             ridge.remove(r);
-            ridge_map.entry(ridge).or_default().push(node);
+            ridge_map.entry(ridge).or_default().push((node, r));
         }
     }
 
-    let mut g = vec![Vec::<usize>::new(); node_count];
+    let mut g = lbl
+        .iter()
+        .map(|label| vec![usize::MAX; label.simplex.len()])
+        .collect::<Vec<_>>();
 
-    for nodes in ridge_map.into_values() {
-        if nodes.len() == 2 {
-            let a = nodes[0];
-            let b = nodes[1];
-            if a < node_count && b < node_count && a != b {
-                g[a].push(b);
-                g[b].push(a);
+    for (ridge, occs) in ridge_map {
+        if occs.len() != 2 {
+            bail!(
+                "ridge {:?} has {} incident simplex occurrences, expected exactly 2",
+                ridge,
+                occs.len()
+            );
+        }
+
+        let (a, ra) = occs[0];
+        let (b, rb) = occs[1];
+
+        if a == b {
+            bail!(
+                "ridge {:?} is paired with two occurrences of the same graph node {a}",
+                ridge
+            );
+        }
+
+        g[a][ra] = b;
+        g[b][rb] = a;
+    }
+
+    for (node, adj) in g.iter().enumerate() {
+        for (r, &other) in adj.iter().enumerate() {
+            if other == usize::MAX {
+                bail!("missing graph neighbor for node {node}, ridge position {r}");
             }
         }
     }
 
-    for adj in &mut g {
-        adj.sort_unstable();
-        adj.dedup();
-    }
-
-    SimplexGraph { g, lbl }
+    Ok(SimplexGraph { g, lbl })
 }
 
 pub fn choose_default_k0(items: &[VertexItem]) -> Result<usize> {
@@ -609,7 +643,7 @@ fn certificate_inequalities(h: &HRep) -> Result<Vec<Inequality>> {
 
 pub fn to_certificate(h: &HRep, mut items: Vec<VertexItem>, root: Root) -> Result<Certificate> {
     let inequalities = certificate_inequalities(h)?;
-    let graph = build_simplex_graph(&mut items);
+    let graph = build_simplex_graph(&mut items)?;
     Ok(Certificate {
         inequalities,
         items,

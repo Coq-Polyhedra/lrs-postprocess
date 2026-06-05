@@ -189,10 +189,10 @@ fn vertex_coords_descr() -> Descr {
 }
 
 fn item_descr() -> Descr {
-    // item := vertex * (incident * simplices)
+    // item := incident * (vertex * simplices)
     pair(
-        vertex_coords_descr(),
-        pair(array(Descr::Int63), array(item_simplex_descr())),
+        array(Descr::Int63),
+        pair(vertex_coords_descr(), array(item_simplex_descr())),
     )
 }
 
@@ -294,9 +294,9 @@ fn write_vertex_coords<W: Write>(w: &mut W, vertex: &VertexCoords) -> Result<()>
 }
 
 fn write_item<W: Write>(w: &mut W, item: &VertexItem) -> Result<()> {
-    // item := vertex * (incident * simplices)
-    write_vertex_coords(w, &item.vertex)?;
+    // item := incident * (vertex * simplices)
     write_usize_array(w, &item.incident)?;
+    write_vertex_coords(w, &item.vertex)?;
     let simplex_d = item_simplex_descr();
     write_array(w, &simplex_d, &item.simplices, |w, simplex| {
         write_item_simplex(w, simplex)
