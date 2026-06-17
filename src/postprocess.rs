@@ -2,7 +2,7 @@ use anyhow::{anyhow, bail, Context, Result};
 use num_bigint::{BigInt, Sign};
 use num_integer::Integer;
 use num_traits::{One, Signed, Zero};
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fs;
 
 use crate::certificate::{Certificate, GraphLabel, Inequality, ItemSimplex, LocalSimplexRef, Root, SimplexGraph, VertexCoords, VertexItem};
@@ -501,6 +501,54 @@ fn build_simplex_graph(items: &mut [VertexItem]) -> Result<SimplexGraph> {
     Ok(SimplexGraph { g, lbl })
 }
 
+fn build_item_neighbors(graph: &SimplexGraph, item_count: usize) -> Result<Vec<Vec<usize>>> {
+    let mut sets = (0..item_count)
+        .map(|_| BTreeSet::<usize>::new())
+        .collect::<Vec<_>>();
+
+    if graph.g.len() != graph.lbl.len() {
+        bail!(
+            "internal error: graph.g has length {}, graph.lbl has length {}",
+            graph.g.len(),
+            graph.lbl.len()
+        );
+    }
+
+    for (node, adj) in graph.g.iter().enumerate() {
+        let v = graph.lbl[node].owner.item;
+        if v >= item_count {
+            bail!(
+                "internal error: graph node {node} has owner item {v}, but there are only {item_count} items"
+            );
+        }
+
+        for &other in adj {
+            if other >= graph.lbl.len() {
+                bail!(
+                    "internal error: graph adjacency {node}->{other} is out of range 0..{}",
+                    graph.lbl.len()
+                );
+            }
+
+            let w = graph.lbl[other].owner.item;
+            if w >= item_count {
+                bail!(
+                    "internal error: graph node {other} has owner item {w}, but there are only {item_count} items"
+                );
+            }
+
+            if v != w {
+                sets[v].insert(w);
+            }
+        }
+    }
+
+    Ok(sets
+        .into_iter()
+        .map(|set| set.into_iter().collect::<Vec<_>>())
+        .collect())
+}
+
 pub fn choose_default_k0(items: &[VertexItem]) -> Result<usize> {
     items
         .iter()
@@ -644,10 +692,12 @@ fn certificate_inequalities(h: &HRep) -> Result<Vec<Inequality>> {
 pub fn to_certificate(h: &HRep, mut items: Vec<VertexItem>, root: Root) -> Result<Certificate> {
     let inequalities = certificate_inequalities(h)?;
     let graph = build_simplex_graph(&mut items)?;
+    let neighbors = build_item_neighbors(&graph, items.len())?;
     Ok(Certificate {
         inequalities,
         items,
         graph,
+        neighbors,
         root,
     })
 }

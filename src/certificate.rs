@@ -9,6 +9,16 @@ pub struct Certificate {
 
     pub items: Vec<VertexItem>,
     pub graph: SimplexGraph,
+
+    /// Candidate edge-neighbors for each item.
+    ///
+    /// neighbors[v] is a strictly sorted list of item indices w.
+    /// The postprocessor derives it from cross-label ridge adjacencies
+    /// in the simplex graph. The checker verifies symmetry and the
+    /// local edge test: I(v) ∩ I(w) is not contained in I(u) for
+    /// every u distinct from v and w.
+    pub neighbors: Vec<Vec<usize>>,
+
     pub root: Root,
 }
 

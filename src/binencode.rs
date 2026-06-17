@@ -218,10 +218,13 @@ fn root_descr() -> Descr {
 }
 
 fn certificate_descr() -> Descr {
-    // certificate := inequalities * (items * (graph * root))
+    // certificate := inequalities * (items * (graph * (neighbors * root)))
     pair(
         array(inequality_descr()),
-        pair(array(item_descr()), pair(graph_descr(), root_descr())),
+        pair(
+            array(item_descr()),
+            pair(graph_descr(), pair(array(array(Descr::Int63)), root_descr())),
+        ),
     )
 }
 
@@ -340,6 +343,8 @@ fn write_certificate_value<W: Write>(w: &mut W, cert: &Certificate) -> Result<()
     write_array(w, &item_d, &cert.items, |w, item| write_item(w, item))?;
 
     write_graph(w, &cert.graph)?;
+
+    write_usize_matrix(w, &cert.neighbors)?;
 
     write_root(w, &cert.root)?;
 

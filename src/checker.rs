@@ -2,6 +2,7 @@ use anyhow::{anyhow, bail, Context, Result};
 use num_bigint::{BigInt, Sign};
 use num_integer::Integer;
 use num_traits::{One, Signed, Zero};
+use std::time::Instant;
 
 use crate::certificate::{read_certificate, Certificate, LocalSimplexRef, Root, VertexCoords, VertexItem};
 use crate::numerics::{dot, mat_mul, parse_q, q_to_string, Q};
@@ -567,6 +568,179 @@ fn check_simplex_graph(h: &HRep, cert: &Certificate) -> Result<()> {
     Ok(())
 }
 
+fn sorted_difference(a: &[usize], b: &[usize]) -> Vec<usize> {
+    // Return a \ b, assuming both lists are strictly sorted.
+    let mut i = 0;
+    let mut j = 0;
+    let mut out = Vec::new();
+
+    while i < a.len() && j < b.len() {
+        if a[i] == b[j] {
+            i += 1;
+            j += 1;
+        } else if a[i] < b[j] {
+            out.push(a[i]);
+            i += 1;
+        } else {
+            j += 1;
+        }
+    }
+
+    while i < a.len() {
+        out.push(a[i]);
+        i += 1;
+    }
+
+    out
+}
+
+fn sorted_intersects(a: &[usize], b: &[usize]) -> bool {
+    // Return true iff a ∩ b is nonempty, assuming both lists are sorted.
+    let mut i = 0;
+    let mut j = 0;
+
+    while i < a.len() && j < b.len() {
+        if a[i] == b[j] {
+            return true;
+        } else if a[i] < b[j] {
+            i += 1;
+        } else {
+            j += 1;
+        }
+    }
+
+    false
+}
+
+fn graph_item_neighbors(cert: &Certificate) -> Result<Vec<Vec<usize>>> {
+    let item_count = cert.items.len();
+    let mut sets = (0..item_count)
+        .map(|_| std::collections::BTreeSet::<usize>::new())
+        .collect::<Vec<_>>();
+
+    if cert.graph.g.len() != cert.graph.lbl.len() {
+        bail!(
+            "graph.g has length {}, but graph.lbl has length {}",
+            cert.graph.g.len(),
+            cert.graph.lbl.len()
+        );
+    }
+
+    for (node, adj) in cert.graph.g.iter().enumerate() {
+        let v = cert.graph.lbl[node].owner.item;
+        if v >= item_count {
+            bail!(
+                "graph.lbl[{node}].owner.item={v} out of range 0..{item_count}"
+            );
+        }
+
+        for &other in adj {
+            if other >= cert.graph.lbl.len() {
+                bail!(
+                    "graph.g[{node}] contains node {other}, out of range 0..{}",
+                    cert.graph.lbl.len()
+                );
+            }
+
+            let w = cert.graph.lbl[other].owner.item;
+            if w >= item_count {
+                bail!(
+                    "graph.lbl[{other}].owner.item={w} out of range 0..{item_count}"
+                );
+            }
+
+            if v != w {
+                sets[v].insert(w);
+            }
+        }
+    }
+
+    Ok(sets
+        .into_iter()
+        .map(|set| set.into_iter().collect::<Vec<_>>())
+        .collect())
+}
+
+fn check_neighbor_lists(cert: &Certificate) -> Result<()> {
+    let n = cert.items.len();
+
+    if cert.neighbors.len() != n {
+        bail!(
+            "cert.neighbors has length {}, expected one list for each of the {n} items",
+            cert.neighbors.len()
+        );
+    }
+
+    for (v, ns) in cert.neighbors.iter().enumerate() {
+        strictly_sorted_len(ns)
+            .with_context(|| format!("neighbors[{v}] is not strictly sorted"))?;
+
+        for &w in ns {
+            if w >= n {
+                bail!("neighbors[{v}] contains item {w}, out of range 0..{n}");
+            }
+            if w == v {
+                bail!("neighbors[{v}] contains a self-neighbor");
+            }
+            if !contains_sorted(&cert.neighbors[w], v) {
+                bail!(
+                    "neighbor relation is not symmetric: {w} occurs in neighbors[{v}], but {v} does not occur in neighbors[{w}]"
+                );
+            }
+        }
+    }
+
+    let expected = graph_item_neighbors(cert).context("failed to derive item-neighbor lists from simplex graph")?;
+    if cert.neighbors != expected {
+        bail!(
+            "cert.neighbors does not match cross-label adjacencies of the simplex graph: certificate={:?}, graph-derived={:?}",
+            cert.neighbors,
+            expected
+        );
+    }
+
+    Ok(())
+}
+
+fn check_local_edge_test(cert: &Certificate) -> Result<()> {
+    let n = cert.items.len();
+
+    for v in 0..n {
+        let iv = &cert.items[v].incident;
+        let nv = &cert.neighbors[v];
+
+        // Transposed formulation of
+        //     I(v) ∩ I(w) ⊄ I(u)
+        // as
+        //     I(w) ∩ (I(v) \ I(u)) ≠ ∅.
+        // For fixed (v,u), compute D = I(v) \ I(u) once, then test all other
+        // neighbors w of v against D.  In the simple case D has one element.
+        for &u in nv {
+            let iu = &cert.items[u].incident;
+            let diff_vu = sorted_difference(iv, iu);
+
+            for &w in nv {
+                if w == u {
+                    continue;
+                }
+
+                let iw = &cert.items[w].incident;
+                if !sorted_intersects(iw, &diff_vu) {
+                    bail!(
+                        "local edge test failed at item {v}: neighbor {w} is not separated from neighbor {u}; I({v}) ∩ I({w}) is contained in I({u}); I({v})\\I({u})={:?}; I({v})={:?}, I({w})={:?}, I({u})={:?}",
+                        diff_vu,
+                        iv,
+                        iw,
+                        iu
+                    );
+                }
+            }
+        }
+    }
+
+    Ok(())
+}
+
 fn check_root_inverse(h: &HRep, cert: &Certificate, root: &Root) -> Result<Vec<Vec<Q>>> {
     let inv = parse_q_matrix(&root.inverse_rows).context("failed to parse root.inverse_rows")?;
 
@@ -668,19 +842,47 @@ fn check_root(h: &HRep, cert: &Certificate) -> Result<()> {
     Ok(())
 }
 
+fn time_check<T, F>(name: &str, f: F) -> Result<T>
+where
+    F: FnOnce() -> Result<T>,
+{
+    let t0 = Instant::now();
+    let res = f();
+    let dt = t0.elapsed();
+    eprintln!("{name}: {:.6} s", dt.as_secs_f64());
+    res
+}
+
 pub fn check_certificate(ine_path: &str, certificate_path: &str) -> Result<()> {
-    let h = parse_lrs_hrep(ine_path).context("failed to parse H-representation")?;
-    let cert = read_certificate(certificate_path)?;
+    let h = time_check("parse H-representation", || {
+        parse_lrs_hrep(ine_path).context("failed to parse H-representation")
+    })?;
 
-    check_certificate_inequalities(&h, &cert).context("certificate inequality check failed")?;
+    let cert = time_check("read certificate", || read_certificate(certificate_path))?;
 
-    check_items_basic(&h, &cert).context("basic item consistency check failed")?;
+    time_check("certificate inequality check", || {
+        check_certificate_inequalities(&h, &cert).context("certificate inequality check failed")
+    })?;
 
-    check_simplex_graph(&h, &cert).context("simplex graph check failed")?;
+    time_check("basic item consistency check", || {
+        check_items_basic(&h, &cert).context("basic item consistency check failed")
+    })?;
 
-    check_root(&h, &cert).context("root check failed")?;
+    time_check("simplex graph check", || {
+        check_simplex_graph(&h, &cert).context("simplex graph check failed")
+    })?;
 
-    check_incident_sets_antichain(&cert).context("incident-set antichain check failed")?;
+    time_check("root check", || {
+        check_root(&h, &cert).context("root check failed")
+    })?;
+
+    time_check("neighbor-list check", || {
+        check_neighbor_lists(&cert).context("neighbor-list check failed")
+    })?;
+
+    time_check("local edge test", || {
+        check_local_edge_test(&cert).context("local edge test failed")
+    })?;
 
     Ok(())
 }
