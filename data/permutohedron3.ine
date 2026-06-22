@@ -1,0 +1,23 @@
+permutohedron order 4; dimension 3
+H-representation
+begin
+14 4 integer
+-1 1 0 0
+-1 0 1 0
+-1 0 0 1
+9 -1 -1 -1
+-3 1 1 0
+-3 1 0 1
+7 0 -1 -1
+-3 0 1 1
+7 -1 0 -1
+7 -1 -1 0
+-6 1 1 1
+4 0 0 -1
+4 0 -1 0
+4 -1 0 0
+end
+allbases
+incidence
+printcobasis 1
+threads 0

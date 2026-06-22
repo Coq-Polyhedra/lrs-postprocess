@@ -1,0 +1,23 @@
+dual_cyclic_d05_n10
+* Dual of a cyclic d-polytope on n=2d moment-curve points.
+* Parameters: t = +1,...,+d,-1,...,-d.
+* Let u(t)=(t,t^2,...,t^d), c=(1/(2d)) sum_t u(t), and N_t=d(u(t)-c).
+* This file encodes N_t x <= d; lrs convention is d - N_t x >= 0.
+H-representation
+begin
+10 6 integer
+5 -5 50 -5 974 -5
+5 -10 35 -40 899 -160
+5 -15 10 -135 574 -1215
+5 -20 -25 -320 -301 -5120
+5 -25 -70 -625 -2146 -15625
+5 5 50 5 974 5
+5 10 35 40 899 160
+5 15 10 135 574 1215
+5 20 -25 320 -301 5120
+5 25 -70 625 -2146 15625
+end
+allbases
+incidence
+printcobasis 1
+threads 0

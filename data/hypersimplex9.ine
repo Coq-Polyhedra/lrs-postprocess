@@ -1,0 +1,30 @@
+* Hypersimplex Delta(5,10), represented in R^9
+* Vertices: 0/1 vectors of length 10 with coordinate sum 5; last coordinate eliminated.
+H-representation
+begin
+20 10 integer
+0 1 0 0 0 0 0 0 0 0
+0 0 1 0 0 0 0 0 0 0
+0 0 0 1 0 0 0 0 0 0
+0 0 0 0 1 0 0 0 0 0
+0 0 0 0 0 1 0 0 0 0
+0 0 0 0 0 0 1 0 0 0
+0 0 0 0 0 0 0 1 0 0
+0 0 0 0 0 0 0 0 1 0
+0 0 0 0 0 0 0 0 0 1
+1 -1 0 0 0 0 0 0 0 0
+1 0 -1 0 0 0 0 0 0 0
+1 0 0 -1 0 0 0 0 0 0
+1 0 0 0 -1 0 0 0 0 0
+1 0 0 0 0 -1 0 0 0 0
+1 0 0 0 0 0 -1 0 0 0
+1 0 0 0 0 0 0 -1 0 0
+1 0 0 0 0 0 0 0 -1 0
+1 0 0 0 0 0 0 0 0 -1
+5 -1 -1 -1 -1 -1 -1 -1 -1 -1
+-4 1 1 1 1 1 1 1 1 1
+end
+allbases
+incidence
+printcobasis 1
+threads 0

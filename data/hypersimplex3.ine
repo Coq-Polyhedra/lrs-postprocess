@@ -1,0 +1,18 @@
+* Hypersimplex Delta(2,4), represented in R^3
+* Vertices: 0/1 vectors of length 4 with coordinate sum 2; last coordinate eliminated.
+H-representation
+begin
+8 4 integer
+0 1 0 0
+0 0 1 0
+0 0 0 1
+1 -1 0 0
+1 0 -1 0
+1 0 0 -1
+2 -1 -1 -1
+-1 1 1 1
+end
+allbases
+incidence
+printcobasis 1
+threads 0
