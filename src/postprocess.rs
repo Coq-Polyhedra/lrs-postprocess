@@ -5,7 +5,7 @@ use num_traits::{One, Signed, Zero};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fs;
 
-use crate::certificate::{Certificate, GraphLabel, Inequality, ItemSimplex, LocalSimplexRef, Root, SimplexGraph, VertexCoords, VertexItem};
+use crate::certificate::{Certificate, GraphLabel, Inequality, Root, SimplexGraph, VertexCoords, VertexItem};
 use crate::numerics::{dot, identity, invert_matrix, mat_mul, parse_q, q_to_string, Q};
 
 #[derive(Debug, Clone)]
@@ -94,6 +94,24 @@ fn sorted_unique(mut v: Vec<usize>) -> Vec<usize> {
     v.dedup();
     v
 }
+fn sorted_subset(a: &[usize], b: &[usize]) -> bool {
+    let mut i = 0;
+    let mut j = 0;
+
+    while i < a.len() && j < b.len() {
+        if a[i] == b[j] {
+            i += 1;
+            j += 1;
+        } else if a[i] > b[j] {
+            j += 1;
+        } else {
+            return false;
+        }
+    }
+
+    i == a.len()
+}
+
 
 /// Parse an lrs-style matrix between begin/end.
 pub fn parse_lrs_matrix(path: &str) -> Result<Vec<Vec<Q>>> {
@@ -344,9 +362,11 @@ pub fn parse_lrs_ext_records(path: &str, d: usize, m_ineq: usize) -> Result<Vec<
     Ok(records)
 }
 
-pub fn build_items(records: Vec<LrsRecord>) -> Result<Vec<VertexItem>> {
+pub fn build_items(records: Vec<LrsRecord>) -> Result<(Vec<VertexItem>, Vec<GraphLabel>)> {
     let mut items: Vec<VertexItem> = Vec::new();
     let mut vertex_to_id: BTreeMap<VertexCoords, usize> = BTreeMap::new();
+    let mut pending_labels: Vec<(Vec<usize>, VertexCoords)> = Vec::new();
+
     for rec in records {
         let vertex = vertex_coords_from_strings(&rec.vertex)?;
 
@@ -354,7 +374,7 @@ pub fn build_items(records: Vec<LrsRecord>) -> Result<Vec<VertexItem>> {
         incident.extend(rec.additional_incident.iter().copied());
         incident = sorted_unique(incident);
 
-        let id = match vertex_to_id.get(&vertex) {
+        match vertex_to_id.get(&vertex) {
             Some(&id) => {
                 if items[id].incident != incident {
                     bail!(
@@ -364,39 +384,25 @@ pub fn build_items(records: Vec<LrsRecord>) -> Result<Vec<VertexItem>> {
                         incident
                     );
                 }
-                id
             }
             None => {
                 let id = items.len();
-
                 vertex_to_id.insert(vertex.clone(), id);
-
                 items.push(VertexItem {
                     incident: incident.clone(),
                     vertex: vertex.clone(),
-                    simplices: Vec::new(),
                 });
-
-                id
             }
-        };
+        }
 
-        let indices = rec
-            .cobasis
-            .iter()
-            .map(|j| {
-                items[id]
-                    .incident
-                    .iter()
-                    .position(|x| x == j)
-                    .ok_or_else(|| anyhow!("cobasis row {j} is not in incident list"))
-            })
-            .collect::<Result<Vec<_>>>()?;
+        let rows = sorted_unique(rec.cobasis.clone());
+        if rows.len() != rec.cobasis.len() {
+            bail!("cobasis contains duplicate row indices: {:?}", rec.cobasis);
+        }
 
-        items[id].simplices.push(ItemSimplex {
-            indices,
-            node: 0,
-        });
+        // The owner is stored by vertex coordinates for now.  We sort items below,
+        // then convert owners to the final item indices.
+        pending_labels.push((rows, vertex));
     }
 
     // Canonicalize item ordering for the certificate: items are sorted
@@ -404,51 +410,36 @@ pub fn build_items(records: Vec<LrsRecord>) -> Result<Vec<VertexItem>> {
     // Coq-side item array searchable by its first component.
     items.sort_by(|a, b| a.incident.cmp(&b.incident));
 
-    Ok(items)
+    let mut coord_to_sorted_id = BTreeMap::<VertexCoords, usize>::new();
+    for (id, item) in items.iter().enumerate() {
+        coord_to_sorted_id.insert(item.vertex.clone(), id);
+    }
+
+    let mut lbl = Vec::<GraphLabel>::with_capacity(pending_labels.len());
+    for (simplex, vertex) in pending_labels {
+        let owner = *coord_to_sorted_id
+            .get(&vertex)
+            .ok_or_else(|| anyhow!("internal error: lost vertex while remapping simplex owners"))?;
+
+        if !sorted_subset(&simplex, &items[owner].incident) {
+            bail!(
+                "simplex {:?} is not contained in incident list of owner item {}: {:?}",
+                simplex,
+                owner,
+                items[owner].incident
+            );
+        }
+
+        lbl.push(GraphLabel { simplex, owner });
+    }
+
+    // Canonicalize graph node numbering by lexicographic order of global simplices.
+    lbl.sort_by(|a, b| a.simplex.cmp(&b.simplex).then(a.owner.cmp(&b.owner)));
+
+    Ok((items, lbl))
 }
 
-fn build_simplex_graph(items: &mut [VertexItem]) -> Result<SimplexGraph> {
-    let node_count = items.iter().map(|item| item.simplices.len()).sum::<usize>();
-
-    let mut entries = Vec::<(Vec<usize>, usize, usize)>::with_capacity(node_count);
-
-    for (item_index, item) in items.iter().enumerate() {
-        for (simplex_index, simplex) in item.simplices.iter().enumerate() {
-            let rows = simplex
-                .indices
-                .iter()
-                .map(|&local| {
-                    item.incident
-                        .get(local)
-                        .copied()
-                        .ok_or_else(|| {
-                            anyhow!(
-                                "item {item_index}, simplex {simplex_index}: local index {local} out of range"
-                            )
-                        })
-                })
-                .collect::<Result<Vec<_>>>()?;
-
-            entries.push((rows, item_index, simplex_index));
-        }
-    }
-
-    // Canonicalize graph node numbering by lexicographic order of global labels.
-    entries.sort_by(|a, b| a.0.cmp(&b.0));
-
-    let mut lbl = Vec::<GraphLabel>::with_capacity(node_count);
-
-    for (node, (rows, item_index, simplex_index)) in entries.into_iter().enumerate() {
-        items[item_index].simplices[simplex_index].node = node;
-        lbl.push(GraphLabel {
-            simplex: rows,
-            owner: LocalSimplexRef {
-                item: item_index,
-                simplex: simplex_index,
-            },
-        });
-    }
-
+pub fn build_simplex_graph(lbl: Vec<GraphLabel>) -> Result<SimplexGraph> {
     // For every ridge occurrence (node, r), store the unique adjacent node
     // through the ridge obtained by deleting lbl[node].simplex[r].
     let mut ridge_map: HashMap<Vec<usize>, Vec<(usize, usize)>> = HashMap::new();
@@ -501,6 +492,7 @@ fn build_simplex_graph(items: &mut [VertexItem]) -> Result<SimplexGraph> {
     Ok(SimplexGraph { g, lbl })
 }
 
+
 fn build_item_neighbors(graph: &SimplexGraph, item_count: usize) -> Result<Vec<Vec<usize>>> {
     let mut sets = (0..item_count)
         .map(|_| BTreeSet::<usize>::new())
@@ -515,7 +507,7 @@ fn build_item_neighbors(graph: &SimplexGraph, item_count: usize) -> Result<Vec<V
     }
 
     for (node, adj) in graph.g.iter().enumerate() {
-        let v = graph.lbl[node].owner.item;
+        let v = graph.lbl[node].owner;
         if v >= item_count {
             bail!(
                 "internal error: graph node {node} has owner item {v}, but there are only {item_count} items"
@@ -530,7 +522,7 @@ fn build_item_neighbors(graph: &SimplexGraph, item_count: usize) -> Result<Vec<V
                 );
             }
 
-            let w = graph.lbl[other].owner.item;
+            let w = graph.lbl[other].owner;
             if w >= item_count {
                 bail!(
                     "internal error: graph node {other} has owner item {w}, but there are only {item_count} items"
@@ -549,15 +541,30 @@ fn build_item_neighbors(graph: &SimplexGraph, item_count: usize) -> Result<Vec<V
         .collect())
 }
 
-pub fn choose_default_k0(items: &[VertexItem]) -> Result<usize> {
-    items
+
+pub fn choose_default_k0(items: &[VertexItem], graph: &SimplexGraph) -> Result<usize> {
+    let mut counts = vec![0usize; items.len()];
+
+    for (node, label) in graph.lbl.iter().enumerate() {
+        if label.owner >= items.len() {
+            bail!(
+                "graph.lbl[{node}].owner={} out of range 0..{}",
+                label.owner,
+                items.len()
+            );
+        }
+        counts[label.owner] += 1;
+    }
+
+    counts
         .iter()
         .enumerate()
-        .filter(|(_, item)| !item.simplices.is_empty())
-        .min_by_key(|(_, item)| item.simplices.len())
+        .filter(|(_, &count)| count > 0)
+        .min_by_key(|(_, &count)| count)
         .map(|(k, _)| k)
-        .ok_or_else(|| anyhow!("cannot choose k0: no vertex item has simplices"))
+        .ok_or_else(|| anyhow!("cannot choose k0: no vertex item owns a simplex"))
 }
+
 
 fn row_matrix_columns_from_global_rows(h: &HRep, rows: &[usize]) -> Vec<Vec<Q>> {
     let d = h.d;
@@ -572,35 +579,21 @@ fn row_matrix_columns_from_global_rows(h: &HRep, rows: &[usize]) -> Vec<Vec<Q>> 
     m
 }
 
-pub fn decode_simplex_global(item: &VertexItem, simplex_index: usize) -> Result<Vec<usize>> {
-    let simplex = item
-        .simplices
-        .get(simplex_index)
-        .ok_or_else(|| anyhow!("invalid simplex index {simplex_index}"))?;
-
-    simplex
-        .indices
-        .iter()
-        .map(|&local| {
-            item.incident
-                .get(local)
-                .copied()
-                .ok_or_else(|| anyhow!("local simplex index {local} out of range"))
-        })
-        .collect()
-}
-
-pub fn root_certificate(h: &HRep, items: &[VertexItem], k0: usize) -> Result<Root> {
+pub fn root_certificate(h: &HRep, items: &[VertexItem], graph: &SimplexGraph, k0: usize) -> Result<Root> {
     let item = items
         .get(k0)
         .ok_or_else(|| anyhow!("invalid k0={k0}; only {} items", items.len()))?;
 
-    if item.simplices.is_empty() {
-        bail!("root vertex item k0={k0} has no simplices");
-    }
+    let rows = graph
+        .lbl
+        .iter()
+        .find(|label| label.owner == k0)
+        .map(|label| label.simplex.clone())
+        .ok_or_else(|| anyhow!("root vertex item k0={k0} owns no simplex"))?;
 
-    let rows = decode_simplex_global(item, 0)
-        .with_context(|| format!("cannot decode root simplex 0 for k0={k0}"))?;
+    if !sorted_subset(&rows, &item.incident) {
+        bail!("root.rows {:?} are not contained in I(k0)={:?}", rows, item.incident);
+    }
 
     if rows.len() != h.d {
         bail!("root simplex has {} rows, expected d={}", rows.len(), h.d);
@@ -616,9 +609,12 @@ pub fn root_certificate(h: &HRep, items: &[VertexItem], k0: usize) -> Result<Roo
 
     let mut same_label_separators = Vec::new();
 
-    for sidx in 1..item.simplices.len() {
-        let other_rows = decode_simplex_global(item, sidx)?;
+    for label in graph.lbl.iter().filter(|label| label.owner == k0) {
+        if label.simplex == rows {
+            continue;
+        }
 
+        let other_rows = &label.simplex;
         let inverse_row = (0..h.d)
             .find(|&a| {
                 let beta = &inv[a];
@@ -626,7 +622,8 @@ pub fn root_certificate(h: &HRep, items: &[VertexItem], k0: usize) -> Result<Roo
             })
             .ok_or_else(|| {
                 anyhow!(
-                    "could not find inverse-row separator for simplex {sidx} of vertex item {k0}"
+                    "could not find inverse-row separator for same-label simplex {:?} of vertex item {k0}",
+                    other_rows
                 )
             })?;
 
@@ -643,6 +640,7 @@ pub fn root_certificate(h: &HRep, items: &[VertexItem], k0: usize) -> Result<Roo
         same_label_separators,
     })
 }
+
 
 fn clear_rationals_to_integer_row(values: &[String]) -> Result<Vec<String>> {
     let mut nums = Vec::<BigInt>::with_capacity(values.len());
@@ -689,9 +687,8 @@ fn certificate_inequalities(h: &HRep) -> Result<Vec<Inequality>> {
         .collect()
 }
 
-pub fn to_certificate(h: &HRep, mut items: Vec<VertexItem>, root: Root) -> Result<Certificate> {
+pub fn to_certificate(h: &HRep, items: Vec<VertexItem>, graph: SimplexGraph, root: Root) -> Result<Certificate> {
     let inequalities = certificate_inequalities(h)?;
-    let graph = build_simplex_graph(&mut items)?;
     let neighbors = build_item_neighbors(&graph, items.len())?;
     Ok(Certificate {
         inequalities,

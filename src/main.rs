@@ -11,8 +11,8 @@ use binencode::write_certificate_bin;
 use certificate::certificate_to_string;
 use checker::check_certificate;
 use postprocess::{
-    build_items, choose_default_k0, parse_lrs_ext_records, parse_lrs_hrep, root_certificate,
-    to_certificate,
+    build_items, build_simplex_graph, choose_default_k0, parse_lrs_ext_records, parse_lrs_hrep,
+    root_certificate, to_certificate,
 };
 
 #[derive(Debug, Clone)]
@@ -211,7 +211,8 @@ fn run_postprocess(args: PostprocessArgs) -> Result<()> {
         bail!("no vertex/cobasis records found in lrs ext output");
     }
 
-    let items = build_items(records).context("failed to build vertex items")?;
+    let (items, labels) = build_items(records).context("failed to build vertex items and global simplices")?;
+    let graph = build_simplex_graph(labels).context("failed to build simplex graph")?;
 
     let k0 = match args.k0 {
         Some(k0) => {
@@ -219,18 +220,18 @@ fn run_postprocess(args: PostprocessArgs) -> Result<()> {
                 bail!("--k0={k0} out of range; there are {} vertex items", items.len());
             }
 
-            if items[k0].simplices.is_empty() {
-                bail!("--k0={k0} has no simplices");
+            if !graph.lbl.iter().any(|label| label.owner == k0) {
+                bail!("--k0={k0} owns no simplex");
             }
 
             k0
         }
 
-        None => choose_default_k0(&items)?,
+        None => choose_default_k0(&items, &graph)?,
     };
 
-    let root = root_certificate(&h, &items, k0).context("failed to build root certificate")?;
-    let cert = to_certificate(&h, items, root)?;
+    let root = root_certificate(&h, &items, &graph, k0).context("failed to build root certificate")?;
+    let cert = to_certificate(&h, items, graph, root)?;
 
     if args.bin {
         let stdout = io::stdout();

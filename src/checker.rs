@@ -4,7 +4,7 @@ use num_integer::Integer;
 use num_traits::{One, Signed, Zero};
 use std::time::Instant;
 
-use crate::certificate::{read_certificate, Certificate, LocalSimplexRef, Root, VertexCoords, VertexItem};
+use crate::certificate::{read_certificate, Certificate, Root, VertexCoords};
 use crate::numerics::{dot, mat_mul, parse_q, q_to_string, Q};
 use crate::postprocess::{parse_lrs_hrep, HRep};
 
@@ -184,23 +184,6 @@ fn row_matrix_columns_from_global_rows(h: &HRep, rows: &[usize]) -> Result<Vec<V
     Ok(m)
 }
 
-fn decode_simplex_global(item: &VertexItem, simplex_index: usize) -> Result<Vec<usize>> {
-    let simplex = item
-        .simplices
-        .get(simplex_index)
-        .ok_or_else(|| anyhow!("invalid simplex index {simplex_index}"))?;
-
-    simplex
-        .indices
-        .iter()
-        .map(|&local| {
-            item.incident
-                .get(local)
-                .copied()
-                .ok_or_else(|| anyhow!("local simplex index {local} out of range"))
-        })
-        .collect()
-}
 
 fn check_certificate_inequalities(h: &HRep, cert: &Certificate) -> Result<()> {
     if cert.inequalities.len() != h.a.len() {
@@ -263,33 +246,6 @@ fn check_items_basic(h: &HRep, cert: &Certificate) -> Result<()> {
                 );
             }
         }
-
-        for (sidx, simplex) in item.simplices.iter().enumerate() {
-            let mut global_rows = Vec::with_capacity(simplex.indices.len());
-
-            for &local in &simplex.indices {
-                if local >= item.incident.len() {
-                    bail!(
-                        "item {k}, simplex {sidx}: local index {local} out of range 0..{}",
-                        item.incident.len()
-                    );
-                }
-
-                global_rows.push(item.incident[local]);
-            }
-
-            let len = strictly_sorted_len(&global_rows).with_context(|| {
-                format!("item {k}, simplex {sidx}: decoded global rows are not strictly sorted")
-            })?;
-
-            if len != h.d {
-                bail!(
-                    "item {k}, simplex {sidx}: decoded simplex has length {}, expected d={}",
-                    len,
-                    h.d
-                );
-            }
-        }
     }
 
     for k in 1..cert.items.len() {
@@ -306,6 +262,7 @@ fn check_items_basic(h: &HRep, cert: &Certificate) -> Result<()> {
 
     Ok(())
 }
+
 
 fn sorted_subset(a: &[usize], b: &[usize]) -> bool {
     // Assumes both are strictly sorted.
@@ -360,76 +317,15 @@ fn check_incident_sets_antichain(cert: &Certificate) -> Result<()> {
     Ok(())
 }
 
-/// Checks the two inverse maps between local simplices and graph nodes.
-///
-/// Forward map f: local simplex -> graph node is stored in `ItemSimplex::node`.
-/// Reverse map g: graph node -> local simplex is stored in `graph.lbl[node].owner`.
-///
-/// The checker verifies both identities: g(f(s)) = s and f(g(k)) = k.
-fn check_node_bijection(cert: &Certificate) -> Result<Vec<LocalSimplexRef>> {
-    let m = cert.graph.lbl.len();
-
-    if cert.graph.g.len() != m {
+fn check_graph_labels(h: &HRep, cert: &Certificate) -> Result<()> {
+    if cert.graph.g.len() != cert.graph.lbl.len() {
         bail!(
             "graph.g has length {}, but graph.lbl has length {}",
             cert.graph.g.len(),
-            m
+            cert.graph.lbl.len()
         );
     }
 
-    for (k, item) in cert.items.iter().enumerate() {
-        for (l, simplex) in item.simplices.iter().enumerate() {
-            let node = simplex.node;
-
-            if node >= m {
-                bail!("item {k}, simplex {l}: graph node {node} out of range 0..{m}");
-            }
-
-            let owner = cert.graph.lbl[node].owner;
-            if owner.item != k || owner.simplex != l {
-                bail!(
-                    "node map identities fail: item {k}, simplex {l} points to node {node}, \
-                     but graph.lbl[{node}].owner = ({},{})",
-                    owner.item,
-                    owner.simplex
-                );
-            }
-        }
-    }
-
-    for (node, label) in cert.graph.lbl.iter().enumerate() {
-        let owner = label.owner;
-        let item = cert.items.get(owner.item).ok_or_else(|| {
-            anyhow!(
-                "graph.lbl[{node}].owner refers to item {}, but there are only {} items",
-                owner.item,
-                cert.items.len()
-            )
-        })?;
-
-        let simplex = item.simplices.get(owner.simplex).ok_or_else(|| {
-            anyhow!(
-                "graph.lbl[{node}].owner refers to item {}, simplex {}, but item has only {} simplices",
-                owner.item,
-                owner.simplex,
-                item.simplices.len()
-            )
-        })?;
-
-        if simplex.node != node {
-            bail!(
-                "node map identities fail: graph.lbl[{node}].owner = ({},{}), but that simplex points to node {}",
-                owner.item,
-                owner.simplex,
-                simplex.node
-            );
-        }
-    }
-
-    Ok(cert.graph.lbl.iter().map(|label| label.owner).collect())
-}
-
-fn check_graph_labels(h: &HRep, cert: &Certificate, node_to_simplex: &[LocalSimplexRef]) -> Result<()> {
     let labels = cert
         .graph
         .lbl
@@ -462,17 +358,20 @@ fn check_graph_labels(h: &HRep, cert: &Certificate, node_to_simplex: &[LocalSimp
             }
         }
 
-        let owner = node_to_simplex[node];
-        let item_index = owner.item;
-        let simplex_index = owner.simplex;
-        let decoded = decode_simplex_global(&cert.items[item_index], simplex_index)
-            .with_context(|| format!("cannot decode item {item_index}, simplex {simplex_index}"))?;
+        let owner = label.owner;
+        let item = cert.items.get(owner).ok_or_else(|| {
+            anyhow!(
+                "graph.lbl[{node}].owner={owner} out of range 0..{}",
+                cert.items.len()
+            )
+        })?;
 
-        if decoded != *lbl {
+        if !sorted_subset(lbl, &item.incident) {
             bail!(
-                "graph.lbl[{node}].simplex does not match decoded item {item_index}, simplex {simplex_index}: graph={:?}, decoded={:?}",
+                "graph.lbl[{node}].simplex={:?} is not contained in I(owner={})={:?}",
                 lbl,
-                decoded
+                owner,
+                item.incident
             );
         }
     }
@@ -502,8 +401,7 @@ fn diff_pos(a: &[usize], b: &[usize]) -> Result<usize> {
 }
 
 fn check_simplex_graph(h: &HRep, cert: &Certificate) -> Result<()> {
-    let node_to_simplex = check_node_bijection(cert)?;
-    check_graph_labels(h, cert, &node_to_simplex)?;
+    check_graph_labels(h, cert)?;
 
     let m = cert.graph.lbl.len();
 
@@ -568,7 +466,7 @@ fn check_simplex_graph(h: &HRep, cert: &Certificate) -> Result<()> {
     Ok(())
 }
 
-fn sorted_difference(a: &[usize], b: &[usize]) -> Vec<usize> {
+fn sorted_difference_values(a: &[usize], b: &[usize]) -> Vec<usize> {
     // Return a \ b, assuming both lists are strictly sorted.
     let mut i = 0;
     let mut j = 0;
@@ -586,30 +484,27 @@ fn sorted_difference(a: &[usize], b: &[usize]) -> Vec<usize> {
         }
     }
 
-    while i < a.len() {
-        out.push(a[i]);
-        i += 1;
-    }
-
+    out.extend_from_slice(&a[i..]);
     out
 }
 
-fn sorted_intersects(a: &[usize], b: &[usize]) -> bool {
-    // Return true iff a ∩ b is nonempty, assuming both lists are sorted.
+fn sorted_not_subset_witness(a: &[usize], b: &[usize]) -> Option<usize> {
+    // Return x in a \ b, if one exists. Both lists are assumed strictly sorted.
     let mut i = 0;
     let mut j = 0;
 
     while i < a.len() && j < b.len() {
         if a[i] == b[j] {
-            return true;
-        } else if a[i] < b[j] {
             i += 1;
+            j += 1;
+        } else if a[i] < b[j] {
+            return Some(a[i]);
         } else {
             j += 1;
         }
     }
 
-    false
+    a.get(i).copied()
 }
 
 fn graph_item_neighbors(cert: &Certificate) -> Result<Vec<Vec<usize>>> {
@@ -627,11 +522,9 @@ fn graph_item_neighbors(cert: &Certificate) -> Result<Vec<Vec<usize>>> {
     }
 
     for (node, adj) in cert.graph.g.iter().enumerate() {
-        let v = cert.graph.lbl[node].owner.item;
+        let v = cert.graph.lbl[node].owner;
         if v >= item_count {
-            bail!(
-                "graph.lbl[{node}].owner.item={v} out of range 0..{item_count}"
-            );
+            bail!("graph.lbl[{node}].owner={v} out of range 0..{item_count}");
         }
 
         for &other in adj {
@@ -642,11 +535,9 @@ fn graph_item_neighbors(cert: &Certificate) -> Result<Vec<Vec<usize>>> {
                 );
             }
 
-            let w = cert.graph.lbl[other].owner.item;
+            let w = cert.graph.lbl[other].owner;
             if w >= item_count {
-                bail!(
-                    "graph.lbl[{other}].owner.item={w} out of range 0..{item_count}"
-                );
+                bail!("graph.lbl[{other}].owner={w} out of range 0..{item_count}");
             }
 
             if v != w {
@@ -690,7 +581,8 @@ fn check_neighbor_lists(cert: &Certificate) -> Result<()> {
         }
     }
 
-    let expected = graph_item_neighbors(cert).context("failed to derive item-neighbor lists from simplex graph")?;
+    let expected = graph_item_neighbors(cert)
+        .context("failed to derive item-neighbor lists from simplex graph")?;
     if cert.neighbors != expected {
         bail!(
             "cert.neighbors does not match cross-label adjacencies of the simplex graph: certificate={:?}, graph-derived={:?}",
@@ -703,35 +595,42 @@ fn check_neighbor_lists(cert: &Certificate) -> Result<()> {
 }
 
 fn check_local_edge_test(cert: &Certificate) -> Result<()> {
-    let n = cert.items.len();
-
-    for v in 0..n {
+    // For fixed v, let D_w = I(v) \ I(w) for w in neighbors[v].
+    // The local edge test, for both orders of every pair of distinct
+    // neighbors, is exactly pairwise incomparability of the D_w.
+    for (v, ns) in cert.neighbors.iter().enumerate() {
         let iv = &cert.items[v].incident;
-        let nv = &cert.neighbors[v];
+        let diffs = ns
+            .iter()
+            .map(|&w| sorted_difference_values(iv, &cert.items[w].incident))
+            .collect::<Vec<_>>();
 
-        // Transposed formulation of
-        //     I(v) ∩ I(w) ⊄ I(u)
-        // as
-        //     I(w) ∩ (I(v) \ I(u)) ≠ ∅.
-        // For fixed (v,u), compute D = I(v) \ I(u) once, then test all other
-        // neighbors w of v against D.  In the simple case D has one element.
-        for &u in nv {
-            let iu = &cert.items[u].incident;
-            let diff_vu = sorted_difference(iv, iu);
-
-            for &w in nv {
-                if w == u {
-                    continue;
-                }
-
-                let iw = &cert.items[w].incident;
-                if !sorted_intersects(iw, &diff_vu) {
+        for j in 0..diffs.len() {
+            for k in (j + 1)..diffs.len() {
+                if sorted_not_subset_witness(&diffs[j], &diffs[k]).is_none() {
                     bail!(
-                        "local edge test failed at item {v}: neighbor {w} is not separated from neighbor {u}; I({v}) ∩ I({w}) is contained in I({u}); I({v})\\I({u})={:?}; I({v})={:?}, I({w})={:?}, I({u})={:?}",
-                        diff_vu,
-                        iv,
-                        iw,
-                        iu
+                        "local edge test failed at item {v}: D_{{{}}}=I({v})\\I({}) is contained in D_{{{}}}=I({v})\\I({}); D_{{{}}}={:?}, D_{{{}}}={:?}",
+                        ns[j],
+                        ns[j],
+                        ns[k],
+                        ns[k],
+                        ns[j],
+                        diffs[j],
+                        ns[k],
+                        diffs[k]
+                    );
+                }
+                if sorted_not_subset_witness(&diffs[k], &diffs[j]).is_none() {
+                    bail!(
+                        "local edge test failed at item {v}: D_{{{}}}=I({v})\\I({}) is contained in D_{{{}}}=I({v})\\I({}); D_{{{}}}={:?}, D_{{{}}}={:?}",
+                        ns[k],
+                        ns[k],
+                        ns[j],
+                        ns[j],
+                        ns[k],
+                        diffs[k],
+                        ns[j],
+                        diffs[j]
                     );
                 }
             }
@@ -762,15 +661,26 @@ fn check_root_inverse(h: &HRep, cert: &Certificate, root: &Root) -> Result<Vec<V
         .get(root.k0)
         .ok_or_else(|| anyhow!("root.k0={} out of range", root.k0))?;
 
-    if item.simplices.is_empty() {
-        bail!("root item k0={} has no simplices", root.k0);
+    if !sorted_subset(&root.rows, &item.incident) {
+        bail!(
+            "root.rows {:?} are not contained in I(root.k0={})={:?}",
+            root.rows,
+            root.k0,
+            item.incident
+        );
     }
 
-    let decoded = decode_simplex_global(item, 0)
-        .with_context(|| format!("cannot decode root simplex 0 for k0={}", root.k0))?;
-
-    if decoded != root.rows {
-        bail!("root.rows do not match decoded simplex items[k0].simplices[0]");
+    if !cert
+        .graph
+        .lbl
+        .iter()
+        .any(|label| label.owner == root.k0 && label.simplex == root.rows)
+    {
+        bail!(
+            "root.rows {:?} do not occur as a global simplex owned by root.k0={}",
+            root.rows,
+            root.k0
+        );
     }
 
     Ok(inv)
@@ -782,27 +692,30 @@ fn check_same_label_separators(
     root: &Root,
     inverse_rows: &[Vec<Q>],
 ) -> Result<()> {
-    let item = cert
-        .items
-        .get(root.k0)
-        .ok_or_else(|| anyhow!("root.k0={} out of range", root.k0))?;
+    let same_label = cert
+        .graph
+        .lbl
+        .iter()
+        .filter(|label| label.owner == root.k0 && label.simplex != root.rows)
+        .collect::<Vec<_>>();
 
-    let expected_len = item.simplices.len().saturating_sub(1);
-
-    if root.same_label_separators.len() != expected_len {
+    if root.same_label_separators.len() != same_label.len() {
         bail!(
             "root.same_label_separators has length {}, expected {}",
             root.same_label_separators.len(),
-            expected_len
+            same_label.len()
         );
     }
 
-    for (offset, &inverse_row) in root.same_label_separators.iter().enumerate() {
-        let sidx = offset + 1;
-
+    for (idx, (label, &inverse_row)) in same_label
+        .iter()
+        .zip(root.same_label_separators.iter())
+        .enumerate()
+    {
         if inverse_row >= h.d {
             bail!(
-                "separator for simplex {sidx} has inverse_row={}, expected in 0..{}",
+                "separator {idx} for same-label simplex {:?} has inverse_row={}, expected in 0..{}",
+                label.simplex,
                 inverse_row,
                 h.d
             );
@@ -810,19 +723,13 @@ fn check_same_label_separators(
 
         let beta = &inverse_rows[inverse_row];
 
-        let rows = decode_simplex_global(item, sidx)
-            .with_context(|| format!("cannot decode same-label simplex {sidx}"))?;
-
-        strictly_sorted_len(&rows).with_context(|| {
-            format!("same-label simplex {sidx}: decoded global rows are not strictly sorted")
-        })?;
-
-        for &j in &rows {
+        for &j in &label.simplex {
             let val = dot(beta, &h.a[j]);
 
             if val > Q::zero() {
                 bail!(
-                    "invalid separator for same-label simplex {sidx}: inverse row {inverse_row} has positive value {val} on row {j}"
+                    "invalid separator for same-label simplex {:?}: inverse row {inverse_row} has positive value {val} on row {j}",
+                    label.simplex
                 );
             }
         }
@@ -841,6 +748,7 @@ fn check_root(h: &HRep, cert: &Certificate) -> Result<()> {
 
     Ok(())
 }
+
 
 fn time_check<T, F>(name: &str, f: F) -> Result<T>
 where

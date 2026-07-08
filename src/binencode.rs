@@ -6,7 +6,7 @@ use std::fs::File;
 use std::io::{BufWriter, Write};
 use std::path::Path;
 
-use crate::certificate::{read_certificate, Certificate, GraphLabel, Inequality, ItemSimplex, LocalSimplexRef, Root, SimplexGraph, VertexCoords, VertexItem};
+use crate::certificate::{read_certificate, Certificate, GraphLabel, Inequality, Root, SimplexGraph, VertexCoords, VertexItem};
 
 #[derive(Clone, Debug)]
 enum Descr {
@@ -172,16 +172,6 @@ fn inequality_descr() -> Descr {
     pair(array(Descr::BigZ), Descr::BigZ)
 }
 
-fn local_simplex_ref_descr() -> Descr {
-    // local_simplex_ref := item * simplex
-    pair(Descr::Int63, Descr::Int63)
-}
-
-fn item_simplex_descr() -> Descr {
-    // item_simplex := indices * node
-    pair(array(Descr::Int63), Descr::Int63)
-}
-
 fn vertex_coords_descr() -> Descr {
     // vertex := integer numerators * common denominator
     // The denominator is positive, hence encoded as BigN.
@@ -189,16 +179,13 @@ fn vertex_coords_descr() -> Descr {
 }
 
 fn item_descr() -> Descr {
-    // item := incident * (vertex * simplices)
-    pair(
-        array(Descr::Int63),
-        pair(vertex_coords_descr(), array(item_simplex_descr())),
-    )
+    // item := incident * vertex
+    pair(array(Descr::Int63), vertex_coords_descr())
 }
 
 fn graph_label_descr() -> Descr {
-    // graph_label := simplex * owner
-    pair(array(Descr::Int63), local_simplex_ref_descr())
+    // graph_label := simplex * owner_item
+    pair(array(Descr::Int63), Descr::Int63)
 }
 
 fn graph_descr() -> Descr {
@@ -253,20 +240,6 @@ fn write_inequality<W: Write>(w: &mut W, ineq: &Inequality) -> Result<()> {
     Ok(())
 }
 
-fn write_local_simplex_ref<W: Write>(w: &mut W, r: &LocalSimplexRef) -> Result<()> {
-    // local_simplex_ref := item * simplex
-    write_int63_usize(w, r.item)?;
-    write_int63_usize(w, r.simplex)?;
-    Ok(())
-}
-
-fn write_item_simplex<W: Write>(w: &mut W, simplex: &ItemSimplex) -> Result<()> {
-    // item_simplex := indices * node
-    write_usize_array(w, &simplex.indices)?;
-    write_int63_usize(w, simplex.node)?;
-    Ok(())
-}
-
 
 fn write_bigz_str<W: Write>(w: &mut W, s: &str) -> Result<()> {
     let z = BigInt::parse_bytes(s.trim().as_bytes(), 10)
@@ -297,20 +270,16 @@ fn write_vertex_coords<W: Write>(w: &mut W, vertex: &VertexCoords) -> Result<()>
 }
 
 fn write_item<W: Write>(w: &mut W, item: &VertexItem) -> Result<()> {
-    // item := incident * (vertex * simplices)
+    // item := incident * vertex
     write_usize_array(w, &item.incident)?;
     write_vertex_coords(w, &item.vertex)?;
-    let simplex_d = item_simplex_descr();
-    write_array(w, &simplex_d, &item.simplices, |w, simplex| {
-        write_item_simplex(w, simplex)
-    })?;
     Ok(())
 }
 
 fn write_graph_label<W: Write>(w: &mut W, label: &GraphLabel) -> Result<()> {
-    // graph_label := simplex * owner
+    // graph_label := simplex * owner_item
     write_usize_array(w, &label.simplex)?;
-    write_local_simplex_ref(w, &label.owner)?;
+    write_int63_usize(w, label.owner)?;
     Ok(())
 }
 

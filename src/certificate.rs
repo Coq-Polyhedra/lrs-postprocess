@@ -7,16 +7,18 @@ pub struct Certificate {
     /// Inequalities A x <= b used by the certificate.
     pub inequalities: Vec<Inequality>,
 
+    /// Candidate vertices/items.  The simplices are no longer stored locally
+    /// here: all simplices live globally in `graph.lbl`.
     pub items: Vec<VertexItem>,
+
     pub graph: SimplexGraph,
 
     /// Candidate edge-neighbors for each item.
     ///
-    /// neighbors[v] is a strictly sorted list of item indices w.
+    /// `neighbors[v]` is a strictly sorted list of item indices `w`.
     /// The postprocessor derives it from cross-label ridge adjacencies
-    /// in the simplex graph. The checker verifies symmetry and the
-    /// local edge test: I(v) ∩ I(w) is not contained in I(u) for
-    /// every u distinct from v and w.
+    /// in the simplex graph. The checker verifies symmetry and exact
+    /// agreement with the graph-derived neighbor relation.
     pub neighbors: Vec<Vec<usize>>,
 
     pub root: Root,
@@ -30,7 +32,6 @@ pub struct Inequality {
     /// Integer right-hand side b_i after clearing denominators in this row.
     pub b: String,
 }
-
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
 pub struct VertexCoords {
@@ -51,23 +52,6 @@ pub struct VertexItem {
 
     /// Vertex coordinates represented as num / den, componentwise.
     pub vertex: VertexCoords,
-
-    pub simplices: Vec<ItemSimplex>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ItemSimplex {
-    /// Local indices into `incident`.
-    pub indices: Vec<usize>,
-
-    /// Node of the global simplex adjacency graph.
-    pub node: usize,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub struct LocalSimplexRef {
-    pub item: usize,
-    pub simplex: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -75,8 +59,8 @@ pub struct GraphLabel {
     /// Global row indices of the simplex. This list must be sorted and have length d.
     pub simplex: Vec<usize>,
 
-    /// Inverse map from this graph node to the corresponding local simplex.
-    pub owner: LocalSimplexRef,
+    /// Owner item/vertex of this global simplex.
+    pub owner: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -88,7 +72,7 @@ pub struct SimplexGraph {
     /// The checker verifies the reciprocal condition.
     pub g: Vec<Vec<usize>>,
 
-    /// Labels of graph nodes. Each entry contains the global simplex and its local owner.
+    /// Labels of graph nodes. Each entry contains the global simplex and its owner item.
     pub lbl: Vec<GraphLabel>,
 }
 
@@ -97,7 +81,7 @@ pub struct Root {
     /// Root vertex item.
     pub k0: usize,
 
-    /// Global row indices of the root simplex, namely items[k0].simplices[0].
+    /// Global row indices of the root simplex.
     pub rows: Vec<usize>,
 
     /// Inverse of the root basis matrix, provided as row vectors.
@@ -106,8 +90,8 @@ pub struct Root {
     /// then inverse_rows[a] dot A_{j_b} = delta_{ab}.
     pub inverse_rows: Vec<Vec<String>>,
 
-    /// For each simplex of items[k0].simplices except simplex 0, in increasing
-    /// simplex order, this gives the row of inverse_rows used as separator.
+    /// For each other global simplex whose owner is k0, in graph-label order,
+    /// this gives the row of inverse_rows used as separator.
     pub same_label_separators: Vec<usize>,
 }
 
