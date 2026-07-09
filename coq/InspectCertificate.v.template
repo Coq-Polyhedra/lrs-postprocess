@@ -12,6 +12,7 @@ Let graph := fst (fst (snd (snd cert))).
 Let lbl := snd (fst (snd (snd cert))).
 Let root := snd (snd (snd cert)).
 
+Check cert.
 Check ineq.
 Check vert.
 Check graph.

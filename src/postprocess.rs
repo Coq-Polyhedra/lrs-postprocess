@@ -566,17 +566,211 @@ pub fn choose_default_k0(items: &[VertexItem], graph: &SimplexGraph) -> Result<u
 }
 
 
-fn row_matrix_columns_from_global_rows(h: &HRep, rows: &[usize]) -> Vec<Vec<Q>> {
-    let d = h.d;
-    let mut m = vec![vec![Q::zero(); d]; d];
 
-    for (col, &j) in rows.iter().enumerate() {
-        for row in 0..d {
-            m[row][col] = h.a[j][row].clone();
+fn q_from_bigint(x: &BigInt) -> Q {
+    Q::from_integer(x.clone())
+}
+
+fn dot_bigint(a: &[BigInt], x: &[BigInt]) -> BigInt {
+    a.iter()
+        .zip(x)
+        .fold(BigInt::zero(), |acc, (ai, xi)| acc + ai * xi)
+}
+
+fn clear_q_vec_to_bigints(xs: &[Q]) -> Vec<BigInt> {
+    let lcm = xs
+        .iter()
+        .fold(BigInt::one(), |acc, x| acc.lcm(x.denom()));
+
+    xs.iter()
+        .map(|x| x.numer() * (&lcm / x.denom()))
+        .collect()
+}
+
+fn integer_inequality_coefficients(h: &HRep) -> Result<Vec<Vec<BigInt>>> {
+    h.a.iter()
+        .zip(&h.b)
+        .enumerate()
+        .map(|(i, (a, b))| {
+            let mut values = a.iter().map(q_to_string).collect::<Vec<_>>();
+            values.push(q_to_string(b));
+            let cleared = clear_rationals_to_integer_row(&values)
+                .with_context(|| format!("failed to clear denominators of inequality {i}"))?;
+            cleared[..cleared.len() - 1]
+                .iter()
+                .enumerate()
+                .map(|(j, s)| {
+                    BigInt::parse_bytes(s.as_bytes(), 10).ok_or_else(|| {
+                        anyhow!("internal error: cleared coefficient {j} of inequality {i} is not an integer: {s}")
+                    })
+                })
+                .collect::<Result<Vec<_>>>()
+        })
+        .collect()
+}
+
+fn root_integer_basis_vectors(a_int: &[Vec<BigInt>], rows: &[usize], d: usize) -> Result<Vec<Vec<BigInt>>> {
+    let mut root_matrix = vec![vec![Q::zero(); d]; d];
+
+    for (r, &row_id) in rows.iter().enumerate() {
+        for c in 0..d {
+            root_matrix[r][c] = q_from_bigint(&a_int[row_id][c]);
         }
     }
 
-    m
+    let inv = invert_matrix(&root_matrix).context("root integer basis matrix is singular")?;
+
+    let mut basis = Vec::with_capacity(d);
+    for j in 0..d {
+        let col = (0..d).map(|r| inv[r][j].clone()).collect::<Vec<_>>();
+        let f_j = clear_q_vec_to_bigints(&col);
+        basis.push(f_j);
+    }
+
+    Ok(basis)
+}
+
+fn build_root_m_matrix(a_int: &[Vec<BigInt>], incident: &[usize], basis: &[Vec<BigInt>]) -> Vec<Vec<BigInt>> {
+    incident
+        .iter()
+        .map(|&row_id| {
+            basis
+                .iter()
+                .map(|f_j| dot_bigint(&a_int[row_id], f_j))
+                .collect()
+        })
+        .collect()
+}
+
+fn combinations_until<T, F>(n: usize, k: usize, f: &mut F) -> Option<T>
+where
+    F: FnMut(&[usize]) -> Option<T>,
+{
+    fn rec<T, F>(n: usize, k: usize, start: usize, cur: &mut Vec<usize>, f: &mut F) -> Option<T>
+    where
+        F: FnMut(&[usize]) -> Option<T>,
+    {
+        if cur.len() == k {
+            return f(cur);
+        }
+
+        let need = k - cur.len();
+        for x in start..=n - need {
+            cur.push(x);
+            if let Some(ans) = rec(n, k, x + 1, cur, f) {
+                return Some(ans);
+            }
+            cur.pop();
+        }
+        None
+    }
+
+    if k > n {
+        return None;
+    }
+    let mut cur = Vec::with_capacity(k);
+    rec(n, k, 0, &mut cur, f)
+}
+
+fn solve_square_q(a: &[Vec<Q>], b: &[Q]) -> Option<Vec<Q>> {
+    let inv = invert_matrix(a).ok()?;
+    let n = b.len();
+    let mut x = vec![Q::zero(); n];
+
+    for i in 0..n {
+        for j in 0..n {
+            x[i] += &inv[i][j] * &b[j];
+        }
+    }
+
+    Some(x)
+}
+
+fn q_dot_bigint_row(row: &[BigInt], x: &[Q], support: &[usize]) -> Q {
+    support
+        .iter()
+        .zip(x)
+        .fold(Q::zero(), |acc, (&j, xj)| acc + q_from_bigint(&row[j]) * xj)
+}
+
+fn sparse_nonnegative_certificate_for_simplex(
+    m_matrix: &[Vec<BigInt>],
+    incident: &[usize],
+    simplex: &[usize],
+    d: usize,
+) -> Result<Vec<(usize, String)>> {
+    let local_rows = simplex
+        .iter()
+        .map(|&row| {
+            incident.binary_search(&row).map_err(|_| {
+                anyhow!("same-owner simplex row {row} is not contained in the owner's incident set")
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+
+    let constraint_rows = local_rows
+        .iter()
+        .map(|&p| m_matrix[p].clone())
+        .collect::<Vec<_>>();
+
+    for support_size in 1..=d {
+        if let Some(answer) = combinations_until(d, support_size, &mut |support| {
+            let active_size = support_size - 1;
+            combinations_until(constraint_rows.len(), active_size, &mut |active| {
+                let mut eqs = Vec::<Vec<Q>>::with_capacity(support_size);
+                eqs.push(vec![Q::one(); support_size]);
+                for &row_idx in active {
+                    eqs.push(
+                        support
+                            .iter()
+                            .map(|&j| q_from_bigint(&constraint_rows[row_idx][j]))
+                            .collect(),
+                    );
+                }
+
+                let mut rhs = vec![Q::zero(); support_size];
+                rhs[0] = Q::one();
+
+                let x = solve_square_q(&eqs, &rhs)?;
+
+                if x.iter().any(|v| v < &Q::zero()) {
+                    return None;
+                }
+
+                if x.iter().all(|v| v.is_zero()) {
+                    return None;
+                }
+
+                if constraint_rows
+                    .iter()
+                    .any(|row| q_dot_bigint_row(row, &x, support) > Q::zero())
+                {
+                    return None;
+                }
+
+                let coeffs = clear_q_vec_to_bigints(&x);
+                let sparse = support
+                    .iter()
+                    .zip(coeffs.iter())
+                    .filter(|(_, c)| !c.is_zero())
+                    .map(|(&j, c)| (j, c.to_string()))
+                    .collect::<Vec<_>>();
+
+                if sparse.is_empty() {
+                    None
+                } else {
+                    Some(sparse)
+                }
+            })
+        }) {
+            return Ok(answer);
+        }
+    }
+
+    bail!(
+        "could not find a nonnegative sparse root certificate vector for same-owner simplex {:?}",
+        simplex
+    )
 }
 
 pub fn root_certificate(h: &HRep, items: &[VertexItem], graph: &SimplexGraph, k0: usize) -> Result<Root> {
@@ -584,60 +778,80 @@ pub fn root_certificate(h: &HRep, items: &[VertexItem], graph: &SimplexGraph, k0
         .get(k0)
         .ok_or_else(|| anyhow!("invalid k0={k0}; only {} items", items.len()))?;
 
-    let rows = graph
+    let simplex_id = graph
         .lbl
         .iter()
-        .find(|label| label.owner == k0)
-        .map(|label| label.simplex.clone())
+        .position(|label| label.owner == k0)
         .ok_or_else(|| anyhow!("root vertex item k0={k0} owns no simplex"))?;
 
-    if !sorted_subset(&rows, &item.incident) {
-        bail!("root.rows {:?} are not contained in I(k0)={:?}", rows, item.incident);
+    let root_label = &graph.lbl[simplex_id];
+    let rows = &root_label.simplex;
+
+    if !sorted_subset(rows, &item.incident) {
+        bail!("root simplex {:?} is not contained in I(k0)={:?}", rows, item.incident);
     }
 
     if rows.len() != h.d {
         bail!("root simplex has {} rows, expected d={}", rows.len(), h.d);
     }
 
-    let rmat = row_matrix_columns_from_global_rows(h, &rows);
-    let inv = invert_matrix(&rmat).context("root basis matrix is singular")?;
+    let a_int = integer_inequality_coefficients(h)?;
+    let basis = root_integer_basis_vectors(&a_int, rows, h.d)?;
+    let m_matrix = build_root_m_matrix(&a_int, &item.incident, &basis);
 
-    let prod = mat_mul(&inv, &rmat);
-    if prod != identity(h.d) {
-        bail!("internal error: computed inverse does not multiply to identity");
+    for (root_pos, &row) in rows.iter().enumerate() {
+        let local_pos = item.incident.binary_search(&row).map_err(|_| {
+            anyhow!("root row {row} is not contained in I(k0)={:?}", item.incident)
+        })?;
+
+        for j in 0..h.d {
+            let val = &m_matrix[local_pos][j];
+            if j == root_pos {
+                if val <= &BigInt::zero() {
+                    bail!(
+                        "root diagonal condition failed for row {row}, column {j}: expected > 0, got {val}"
+                    );
+                }
+            } else if !val.is_zero() {
+                bail!(
+                    "root off-diagonal condition failed for row {row}, column {j}: expected 0, got {val}"
+                );
+            }
+        }
     }
 
-    let mut same_label_separators = Vec::new();
-
-    for label in graph.lbl.iter().filter(|label| label.owner == k0) {
-        if label.simplex == rows {
+    let mut q_vectors = Vec::new();
+    for (label_id, label) in graph.lbl.iter().enumerate() {
+        if label.owner != k0 || label_id == simplex_id {
             continue;
         }
 
-        let other_rows = &label.simplex;
-        let inverse_row = (0..h.d)
-            .find(|&a| {
-                let beta = &inv[a];
-                other_rows.iter().all(|&j| dot(beta, &h.a[j]) <= Q::zero())
-            })
-            .ok_or_else(|| {
-                anyhow!(
-                    "could not find inverse-row separator for same-label simplex {:?} of vertex item {k0}",
-                    other_rows
-                )
-            })?;
-
-        same_label_separators.push(inverse_row);
+        let q = sparse_nonnegative_certificate_for_simplex(
+            &m_matrix,
+            &item.incident,
+            &label.simplex,
+            h.d,
+        )
+        .with_context(|| {
+            format!(
+                "failed to build sparse root Q-vector for same-owner simplex graph node {label_id} with simplex {:?}",
+                label.simplex
+            )
+        })?;
+        q_vectors.push(q);
     }
 
     Ok(Root {
-        k0,
-        rows,
-        inverse_rows: inv
+        simplex_id,
+        basis_vectors: basis
             .iter()
-            .map(|row| row.iter().map(q_to_string).collect())
+            .map(|row| row.iter().map(ToString::to_string).collect())
             .collect(),
-        same_label_separators,
+        m_matrix: m_matrix
+            .iter()
+            .map(|row| row.iter().map(ToString::to_string).collect())
+            .collect(),
+        q_vectors,
     })
 }
 

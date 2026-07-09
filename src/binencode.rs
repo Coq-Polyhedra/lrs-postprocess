@@ -193,13 +193,23 @@ fn graph_descr() -> Descr {
     pair(array(array(Descr::Int63)), array(graph_label_descr()))
 }
 
+fn sparse_entry_descr() -> Descr {
+    // sparse_entry := coordinate * coefficient
+    pair(Descr::Int63, Descr::BigZ)
+}
+
+fn sparse_vector_descr() -> Descr {
+    // sparse_vector := array sparse_entry
+    array(sparse_entry_descr())
+}
+
 fn root_descr() -> Descr {
-    // root := k0 * (rows * (inverse_rows * same_label_separators))
+    // root := simplex_id * (basis_vectors * (m_matrix * q_vectors))
     pair(
         Descr::Int63,
         pair(
-            array(Descr::Int63),
-            pair(array(array(Descr::BigQ)), array(Descr::Int63)),
+            array(array(Descr::BigZ)),
+            pair(array(array(Descr::BigZ)), array(sparse_vector_descr())),
         ),
     )
 }
@@ -226,6 +236,11 @@ fn write_bigq_string_array<W: Write>(w: &mut W, xs: &[String]) -> Result<()> {
 fn write_bigq_string_matrix<W: Write>(w: &mut W, m: &[Vec<String>]) -> Result<()> {
     let row_descr = array(Descr::BigQ);
     write_array(w, &row_descr, m, |w, row| write_bigq_string_array(w, row))
+}
+
+fn write_bigz_string_matrix<W: Write>(w: &mut W, m: &[Vec<String>]) -> Result<()> {
+    let row_descr = array(Descr::BigZ);
+    write_array(w, &row_descr, m, |w, row| write_bigz_string_array(w, row))
 }
 
 fn write_usize_matrix<W: Write>(w: &mut W, m: &[Vec<usize>]) -> Result<()> {
@@ -293,12 +308,25 @@ fn write_graph<W: Write>(w: &mut W, graph: &SimplexGraph) -> Result<()> {
     Ok(())
 }
 
+fn write_sparse_entry<W: Write>(w: &mut W, entry: &(usize, String)) -> Result<()> {
+    write_int63_usize(w, entry.0)?;
+    write_bigz_str(w, &entry.1)?;
+    Ok(())
+}
+
+fn write_sparse_vector<W: Write>(w: &mut W, sparse: &[(usize, String)]) -> Result<()> {
+    let entry_d = sparse_entry_descr();
+    write_array(w, &entry_d, sparse, |w, entry| write_sparse_entry(w, entry))
+}
+
 fn write_root<W: Write>(w: &mut W, root: &Root) -> Result<()> {
-    // root := k0 * (rows * (inverse_rows * same_label_separators))
-    write_int63_usize(w, root.k0)?;
-    write_usize_array(w, &root.rows)?;
-    write_bigq_string_matrix(w, &root.inverse_rows)?;
-    write_usize_array(w, &root.same_label_separators)?;
+    // root := simplex_id * (basis_vectors * (m_matrix * q_vectors))
+    write_int63_usize(w, root.simplex_id)?;
+    write_bigz_string_matrix(w, &root.basis_vectors)?;
+    write_bigz_string_matrix(w, &root.m_matrix)?;
+
+    let sparse_d = sparse_vector_descr();
+    write_array(w, &sparse_d, &root.q_vectors, |w, sparse| write_sparse_vector(w, sparse))?;
     Ok(())
 }
 

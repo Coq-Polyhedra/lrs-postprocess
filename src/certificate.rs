@@ -78,21 +78,28 @@ pub struct SimplexGraph {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Root {
-    /// Root vertex item.
-    pub k0: usize,
+    /// Graph-node index of the distinguished root simplex sigma*.
+    pub simplex_id: usize,
 
-    /// Global row indices of the root simplex.
-    pub rows: Vec<usize>,
-
-    /// Inverse of the root basis matrix, provided as row vectors.
+    /// Integer vectors f_1, ..., f_d.
     ///
-    /// If rows are j_1,...,j_d and R has columns A_{j_r}^T,
-    /// then inverse_rows[a] dot A_{j_b} = delta_{ab}.
-    pub inverse_rows: Vec<Vec<String>>,
+    /// The outer array is indexed by j, and `basis_vectors[j]` is the
+    /// coordinate vector f_j in the ambient dimension d.
+    pub basis_vectors: Vec<Vec<String>>,
 
-    /// For each other global simplex whose owner is k0, in graph-label order,
-    /// this gives the row of inverse_rows used as separator.
-    pub same_label_separators: Vec<usize>,
+    /// Matrix M indexed by local active-inequality position and basis-vector index.
+    ///
+    /// If sigma* is owned by v and I_v = items[v].incident, then
+    /// `m_matrix[p][j] = a_{I_v[p]}^T f_j`, where the integer row a_i is
+    /// the numerator row stored in `inequalities[i].a`.
+    pub m_matrix: Vec<Vec<String>>,
+
+    /// Sparse nonnegative certificates for same-owner simplices distinct from sigma*.
+    ///
+    /// Entries are listed in graph-label order over labels with the same owner as
+    /// sigma*, excluding sigma* itself. A sparse vector is encoded as sorted pairs
+    /// `(coordinate, positive_integer_value)`.
+    pub q_vectors: Vec<Vec<(usize, String)>>,
 }
 
 pub fn write_certificate(path: &str, cert: &Certificate, pretty: bool) -> Result<()> {

@@ -640,111 +640,221 @@ fn check_local_edge_test(cert: &Certificate) -> Result<()> {
     Ok(())
 }
 
-fn check_root_inverse(h: &HRep, cert: &Certificate, root: &Root) -> Result<Vec<Vec<Q>>> {
-    let inv = parse_q_matrix(&root.inverse_rows).context("failed to parse root.inverse_rows")?;
 
-    if inv.len() != h.d || inv.iter().any(|row| row.len() != h.d) {
-        bail!("root.inverse_rows must be a {} x {} matrix", h.d, h.d);
-    }
-
-    let rmat =
-        row_matrix_columns_from_global_rows(h, &root.rows).context("failed to build root matrix")?;
-
-    let prod = mat_mul(&inv, &rmat);
-
-    if prod != identity(h.d) {
-        bail!("root.inverse_rows do not invert the root basis matrix");
-    }
-
-    let item = cert
-        .items
-        .get(root.k0)
-        .ok_or_else(|| anyhow!("root.k0={} out of range", root.k0))?;
-
-    if !sorted_subset(&root.rows, &item.incident) {
-        bail!(
-            "root.rows {:?} are not contained in I(root.k0={})={:?}",
-            root.rows,
-            root.k0,
-            item.incident
-        );
-    }
-
-    if !cert
-        .graph
-        .lbl
-        .iter()
-        .any(|label| label.owner == root.k0 && label.simplex == root.rows)
-    {
-        bail!(
-            "root.rows {:?} do not occur as a global simplex owned by root.k0={}",
-            root.rows,
-            root.k0
-        );
-    }
-
-    Ok(inv)
+fn parse_bigint_vec(xs: &[String], what: &str) -> Result<Vec<BigInt>> {
+    xs.iter()
+        .enumerate()
+        .map(|(i, s)| parse_bigint_decimal(s, &format!("{what}[{i}]")))
+        .collect()
 }
 
-fn check_same_label_separators(
-    h: &HRep,
-    cert: &Certificate,
-    root: &Root,
-    inverse_rows: &[Vec<Q>],
-) -> Result<()> {
-    let same_label = cert
-        .graph
-        .lbl
-        .iter()
-        .filter(|label| label.owner == root.k0 && label.simplex != root.rows)
-        .collect::<Vec<_>>();
-
-    if root.same_label_separators.len() != same_label.len() {
-        bail!(
-            "root.same_label_separators has length {}, expected {}",
-            root.same_label_separators.len(),
-            same_label.len()
-        );
+fn parse_bigint_matrix(m: &[Vec<String>], rows: usize, cols: usize, what: &str) -> Result<Vec<Vec<BigInt>>> {
+    if m.len() != rows {
+        bail!("{what} has {} rows, expected {rows}", m.len());
     }
 
-    for (idx, (label, &inverse_row)) in same_label
-        .iter()
-        .zip(root.same_label_separators.iter())
+    m.iter()
         .enumerate()
-    {
-        if inverse_row >= h.d {
-            bail!(
-                "separator {idx} for same-label simplex {:?} has inverse_row={}, expected in 0..{}",
-                label.simplex,
-                inverse_row,
-                h.d
-            );
-        }
+        .map(|(i, row)| {
+            if row.len() != cols {
+                bail!("{what}[{i}] has {} columns, expected {cols}", row.len());
+            }
+            parse_bigint_vec(row, &format!("{what}[{i}]"))
+        })
+        .collect()
+}
 
-        let beta = &inverse_rows[inverse_row];
+fn dot_bigint(a: &[BigInt], x: &[BigInt]) -> BigInt {
+    a.iter()
+        .zip(x)
+        .fold(BigInt::zero(), |acc, (ai, xi)| acc + ai * xi)
+}
 
-        for &j in &label.simplex {
-            let val = dot(beta, &h.a[j]);
-
-            if val > Q::zero() {
+fn parse_certificate_integer_rows(cert: &Certificate, d: usize) -> Result<Vec<Vec<BigInt>>> {
+    cert.inequalities
+        .iter()
+        .enumerate()
+        .map(|(i, ineq)| {
+            if ineq.a.len() != d {
                 bail!(
-                    "invalid separator for same-label simplex {:?}: inverse row {inverse_row} has positive value {val} on row {j}",
-                    label.simplex
+                    "certificate inequality {i} has {} coefficients, expected d={d}",
+                    ineq.a.len()
                 );
             }
-        }
-    }
-
-    Ok(())
+            parse_bigint_vec(&ineq.a, &format!("inequality {i}.a"))
+        })
+        .collect()
 }
 
 fn check_root(h: &HRep, cert: &Certificate) -> Result<()> {
     let root = &cert.root;
 
-    let inverse_rows = check_root_inverse(h, cert, root)?;
+    if root.simplex_id >= cert.graph.lbl.len() {
+        bail!(
+            "root.simplex_id={} out of range 0..{}",
+            root.simplex_id,
+            cert.graph.lbl.len()
+        );
+    }
 
-    check_same_label_separators(h, cert, root, &inverse_rows)
-        .context("same-label separator check failed")?;
+    let root_label = &cert.graph.lbl[root.simplex_id];
+    let k0 = root_label.owner;
+    let item = cert
+        .items
+        .get(k0)
+        .ok_or_else(|| anyhow!("root owner k0={k0} out of range 0..{}", cert.items.len()))?;
+
+    if root_label.simplex.len() != h.d {
+        bail!(
+            "root simplex graph node {} has length {}, expected d={}",
+            root.simplex_id,
+            root_label.simplex.len(),
+            h.d
+        );
+    }
+
+    if !sorted_subset(&root_label.simplex, &item.incident) {
+        bail!(
+            "root simplex {:?} is not contained in I(root owner {})={:?}",
+            root_label.simplex,
+            k0,
+            item.incident
+        );
+    }
+
+    let basis = parse_bigint_matrix(&root.basis_vectors, h.d, h.d, "root.basis_vectors")?;
+    let m_matrix = parse_bigint_matrix(
+        &root.m_matrix,
+        item.incident.len(),
+        h.d,
+        "root.m_matrix",
+    )?;
+    let a_int = parse_certificate_integer_rows(cert, h.d)?;
+
+    for (p, &row_id) in item.incident.iter().enumerate() {
+        let a = a_int.get(row_id).ok_or_else(|| {
+            anyhow!(
+                "item {k0}: incident row {row_id} out of range 0..{}",
+                a_int.len()
+            )
+        })?;
+
+        for j in 0..h.d {
+            let expected = dot_bigint(a, &basis[j]);
+            if m_matrix[p][j] != expected {
+                bail!(
+                    "root M mismatch at active row position {p} (global row {row_id}), column {j}: got {}, expected {}",
+                    m_matrix[p][j],
+                    expected
+                );
+            }
+        }
+    }
+
+    for (root_pos, &row_id) in root_label.simplex.iter().enumerate() {
+        let local_pos = item.incident.binary_search(&row_id).map_err(|_| {
+            anyhow!(
+                "root row {row_id} is not contained in I(root owner {})={:?}",
+                k0,
+                item.incident
+            )
+        })?;
+
+        for j in 0..h.d {
+            let val = &m_matrix[local_pos][j];
+            if j == root_pos {
+                if val <= &BigInt::zero() {
+                    bail!(
+                        "root diagonal condition failed for row {row_id}, column {j}: expected > 0, got {val}"
+                    );
+                }
+            } else if !val.is_zero() {
+                bail!(
+                    "root off-diagonal condition failed for row {row_id}, column {j}: expected 0, got {val}"
+                );
+            }
+        }
+    }
+
+    let same_owner_nonroot = cert
+        .graph
+        .lbl
+        .iter()
+        .enumerate()
+        .filter(|(label_id, label)| label.owner == k0 && *label_id != root.simplex_id)
+        .collect::<Vec<_>>();
+
+    if root.q_vectors.len() != same_owner_nonroot.len() {
+        bail!(
+            "root.q_vectors has length {}, expected {} same-owner non-root simplices",
+            root.q_vectors.len(),
+            same_owner_nonroot.len()
+        );
+    }
+
+    for (q_idx, ((label_id, label), sparse)) in same_owner_nonroot
+        .iter()
+        .zip(root.q_vectors.iter())
+        .enumerate()
+    {
+        let mut last_index = None::<usize>;
+        let mut nonzero = false;
+        let mut parsed = Vec::<(usize, BigInt)>::with_capacity(sparse.len());
+
+        for (entry_pos, (coord, value_s)) in sparse.iter().enumerate() {
+            if *coord >= h.d {
+                bail!(
+                    "root.q_vectors[{q_idx}][{entry_pos}] has coordinate {}, expected in 0..{}",
+                    coord,
+                    h.d
+                );
+            }
+            if let Some(prev) = last_index {
+                if prev >= *coord {
+                    bail!(
+                        "root.q_vectors[{q_idx}] is not strictly sorted by coordinate: {prev} then {coord}"
+                    );
+                }
+            }
+            last_index = Some(*coord);
+
+            let value = parse_bigint_decimal(value_s, &format!("root.q_vectors[{q_idx}][{entry_pos}].value"))?;
+            if value < BigInt::zero() {
+                bail!(
+                    "root.q_vectors[{q_idx}][{entry_pos}] has negative value {value}"
+                );
+            }
+            if !value.is_zero() {
+                nonzero = true;
+            }
+            parsed.push((*coord, value));
+        }
+
+        if !nonzero {
+            bail!("root.q_vectors[{q_idx}] for graph node {label_id} is zero");
+        }
+
+        for &row_id in &label.simplex {
+            let local_pos = item.incident.binary_search(&row_id).map_err(|_| {
+                anyhow!(
+                    "same-owner simplex graph node {label_id} contains row {row_id}, not in I(root owner {})={:?}",
+                    k0,
+                    item.incident
+                )
+            })?;
+
+            let mut sum = BigInt::zero();
+            for (coord, value) in &parsed {
+                sum += value * &m_matrix[local_pos][*coord];
+            }
+
+            if sum > BigInt::zero() {
+                bail!(
+                    "root.q_vectors[{q_idx}] fails on same-owner graph node {label_id}, row {row_id}: dot = {sum} > 0"
+                );
+            }
+        }
+    }
 
     Ok(())
 }
