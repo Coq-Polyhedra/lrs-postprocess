@@ -493,54 +493,71 @@ pub fn build_simplex_graph(lbl: Vec<GraphLabel>) -> Result<SimplexGraph> {
 }
 
 
-fn build_item_neighbors(graph: &SimplexGraph, item_count: usize) -> Result<Vec<Vec<usize>>> {
-    let mut sets = (0..item_count)
-        .map(|_| BTreeSet::<usize>::new())
-        .collect::<Vec<_>>();
-
+fn build_item_neighbors_and_lifts(
+    graph: &SimplexGraph,
+    item_count: usize,
+) -> Result<(Vec<Vec<usize>>, Vec<Vec<(usize, usize)>>)> {
     if graph.g.len() != graph.lbl.len() {
         bail!(
-            "internal error: graph.g has length {}, graph.lbl has length {}",
+            "simplex graph adjacency has length {}, but labels have length {}",
             graph.g.len(),
             graph.lbl.len()
         );
     }
 
-    for (node, adj) in graph.g.iter().enumerate() {
-        let v = graph.lbl[node].owner;
+    // For each directed owner edge v -> w, retain the lexicographically
+    // smallest oriented simplex-graph edge (s,t) mapping to it.
+    let mut lifts = (0..item_count)
+        .map(|_| BTreeMap::<usize, (usize, usize)>::new())
+        .collect::<Vec<_>>();
+
+    for (s, adj) in graph.g.iter().enumerate() {
+        let v = graph.lbl[s].owner;
         if v >= item_count {
-            bail!(
-                "internal error: graph node {node} has owner item {v}, but there are only {item_count} items"
-            );
+            bail!("graph label {s} has owner {v}, out of range 0..{item_count}");
         }
 
-        for &other in adj {
-            if other >= graph.lbl.len() {
+        for &t in adj {
+            if t >= graph.lbl.len() {
                 bail!(
-                    "internal error: graph adjacency {node}->{other} is out of range 0..{}",
+                    "graph adjacency[{s}] contains node {t}, out of range 0..{}",
                     graph.lbl.len()
                 );
             }
-
-            let w = graph.lbl[other].owner;
+            let w = graph.lbl[t].owner;
             if w >= item_count {
-                bail!(
-                    "internal error: graph node {other} has owner item {w}, but there are only {item_count} items"
-                );
+                bail!("graph label {t} has owner {w}, out of range 0..{item_count}");
+            }
+            if v == w {
+                continue;
             }
 
-            if v != w {
-                sets[v].insert(w);
-            }
+            lifts[v]
+                .entry(w)
+                .and_modify(|old| {
+                    if (s, t) < *old {
+                        *old = (s, t);
+                    }
+                })
+                .or_insert((s, t));
         }
     }
 
-    Ok(sets
-        .into_iter()
-        .map(|set| set.into_iter().collect::<Vec<_>>())
-        .collect())
-}
+    let mut neighbors = Vec::with_capacity(item_count);
+    let mut geom_edge_lifts = Vec::with_capacity(item_count);
+    for map in lifts {
+        let mut ns = Vec::with_capacity(map.len());
+        let mut es = Vec::with_capacity(map.len());
+        for (w, edge) in map {
+            ns.push(w);
+            es.push(edge);
+        }
+        neighbors.push(ns);
+        geom_edge_lifts.push(es);
+    }
 
+    Ok((neighbors, geom_edge_lifts))
+}
 
 pub fn choose_default_k0(items: &[VertexItem], graph: &SimplexGraph) -> Result<usize> {
     let mut counts = vec![0usize; items.len()];
@@ -915,7 +932,8 @@ fn certificate_inequalities(h: &HRep) -> Result<Vec<Inequality>> {
 
 pub fn to_certificate(h: &HRep, items: Vec<VertexItem>, graph: SimplexGraph, root: Root) -> Result<Certificate> {
     let inequalities = certificate_inequalities(h)?;
-    let neighbors = build_item_neighbors(&graph, items.len())?;
+    let (neighbors, geom_edge_lifts) =
+        build_item_neighbors_and_lifts(&graph, items.len())?;
     Ok(Certificate {
         n_inequalities: h.a.len(),
         dimension: h.d,
@@ -923,6 +941,7 @@ pub fn to_certificate(h: &HRep, items: Vec<VertexItem>, graph: SimplexGraph, roo
         items,
         graph,
         neighbors,
+        geom_edge_lifts,
         root,
     })
 }

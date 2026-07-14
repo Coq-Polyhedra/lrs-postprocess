@@ -27,6 +27,12 @@ pub struct Certificate {
     /// agreement with the graph-derived neighbor relation.
     pub neighbors: Vec<Vec<usize>>,
 
+    /// For every directed geometric edge `v -> neighbors[v][j]`, stores
+    /// one oriented simplex-graph edge `(s, t)` with owner(s)=v and
+    /// owner(t)=neighbors[v][j]. This array is positionally parallel to
+    /// `neighbors`.
+    pub geom_edge_lifts: Vec<Vec<(usize, usize)>>,
+
     pub root: Root,
 }
 

@@ -4,7 +4,7 @@ From BinReader Require Import BinReader.
 
 Time LoadData "__BIN_FILE__" As cert.
 
-Section Inspect.
+(*Section Inspect.
 
 Let cert := snd (snd cert).
 Let ineq := fst cert.
@@ -25,4 +25,4 @@ Eval vm_compute in PArray.length vert.
 Eval vm_compute in PArray.length graph.
 Eval vm_compute in PArray.length lbl.
 
-End Inspect.
+End Inspect.*)

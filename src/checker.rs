@@ -619,6 +619,56 @@ fn check_neighbor_lists(cert: &Certificate) -> Result<()> {
     Ok(())
 }
 
+fn check_geom_edge_lifts(cert: &Certificate) -> Result<()> {
+    let n = cert.items.len();
+    if cert.geom_edge_lifts.len() != n {
+        bail!(
+            "cert.geom_edge_lifts has length {}, expected one list for each of the {n} items",
+            cert.geom_edge_lifts.len()
+        );
+    }
+
+    for v in 0..n {
+        let ns = &cert.neighbors[v];
+        let lifts = &cert.geom_edge_lifts[v];
+        if lifts.len() != ns.len() {
+            bail!(
+                "geom_edge_lifts[{v}] has length {}, but neighbors[{v}] has length {}",
+                lifts.len(),
+                ns.len()
+            );
+        }
+
+        for (j, (&w, &(s, t))) in ns.iter().zip(lifts).enumerate() {
+            if s >= cert.graph.lbl.len() || t >= cert.graph.lbl.len() {
+                bail!(
+                    "geom_edge_lifts[{v}][{j}]=({s},{t}) contains a graph node out of range 0..{}",
+                    cert.graph.lbl.len()
+                );
+            }
+            if cert.graph.lbl[s].owner != v {
+                bail!(
+                    "geom_edge_lifts[{v}][{j}]=({s},{t}): owner of source simplex is {}, expected {v}",
+                    cert.graph.lbl[s].owner
+                );
+            }
+            if cert.graph.lbl[t].owner != w {
+                bail!(
+                    "geom_edge_lifts[{v}][{j}]=({s},{t}): owner of target simplex is {}, expected neighbor {w}",
+                    cert.graph.lbl[t].owner
+                );
+            }
+            if s >= cert.graph.g.len() || !cert.graph.g[s].iter().any(|&u| u == t) {
+                bail!(
+                    "geom_edge_lifts[{v}][{j}]=({s},{t}) is not an oriented edge of the simplex graph"
+                );
+            }
+        }
+    }
+
+    Ok(())
+}
+
 fn check_local_edge_test(cert: &Certificate) -> Result<()> {
     // For fixed v, let D_w = I(v) \ I(w) for w in neighbors[v].
     // The local edge test, for both orders of every pair of distinct
@@ -971,6 +1021,10 @@ pub fn check_certificate(ine_path: &str, certificate_path: &str) -> Result<()> {
 
     time_check("neighbor-list check", || {
         check_neighbor_lists(&cert).context("neighbor-list check failed")
+    })?;
+
+    time_check("geometric-edge lift check", || {
+        check_geom_edge_lifts(&cert).context("geometric-edge lift check failed")
     })?;
 
     time_check("local edge test", || {

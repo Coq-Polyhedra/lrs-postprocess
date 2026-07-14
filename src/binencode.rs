@@ -218,7 +218,16 @@ fn root_descr() -> Descr {
 }
 
 fn certificate_descr() -> Descr {
-    // certificate := n_inequalities * (dimension * (inequalities * (items * (graph * (neighbors * root)))))
+    // The lift of geom_graph[v][j] is split into two parallel maps:
+    //   geom_edge_sources[v][j] = source simplex node,
+    //   geom_edge_targets[v][j] = local index of the target in graph[source].
+    // certificate := n_inequalities *
+    //   (dimension *
+    //    (inequalities *
+    //     (items *
+    //      (graph *
+    //       (neighbors *
+    //        (geom_edge_sources * (geom_edge_targets * root)))))))
     pair(
         Descr::Int63,
         pair(
@@ -227,7 +236,16 @@ fn certificate_descr() -> Descr {
                 array(inequality_descr()),
                 pair(
                     array(item_descr()),
-                    pair(graph_descr(), pair(array(array(Descr::Int63)), root_descr())),
+                    pair(
+                        graph_descr(),
+                        pair(
+                            array(array(Descr::Int63)),
+                            pair(
+                                array(array(Descr::Int63)),
+                                pair(array(array(Descr::Int63)), root_descr()),
+                            ),
+                        ),
+                    ),
                 ),
             ),
         ),
@@ -328,6 +346,93 @@ fn write_sparse_vector<W: Write>(w: &mut W, sparse: &[(usize, String)]) -> Resul
     write_array(w, &entry_d, sparse, |w, entry| write_sparse_entry(w, entry))
 }
 
+fn split_geom_edge_lifts(
+    cert: &Certificate,
+) -> Result<(Vec<Vec<usize>>, Vec<Vec<usize>>)> {
+    if cert.geom_edge_lifts.len() != cert.neighbors.len() {
+        bail!(
+            "geom_edge_lifts has {} rows, but neighbors has {} rows",
+            cert.geom_edge_lifts.len(),
+            cert.neighbors.len()
+        );
+    }
+
+    let mut sources = Vec::with_capacity(cert.geom_edge_lifts.len());
+    let mut local_targets = Vec::with_capacity(cert.geom_edge_lifts.len());
+
+    for (v, (lift_row, neighbor_row)) in cert
+        .geom_edge_lifts
+        .iter()
+        .zip(cert.neighbors.iter())
+        .enumerate()
+    {
+        if lift_row.len() != neighbor_row.len() {
+            bail!(
+                "geom_edge_lifts[{v}] has length {}, but neighbors[{v}] has length {}",
+                lift_row.len(),
+                neighbor_row.len()
+            );
+        }
+
+        let mut source_row = Vec::with_capacity(lift_row.len());
+        let mut target_row = Vec::with_capacity(lift_row.len());
+
+        for (j, (&(source, target), &neighbor)) in
+            lift_row.iter().zip(neighbor_row.iter()).enumerate()
+        {
+            let source_label = cert.graph.lbl.get(source).ok_or_else(|| {
+                anyhow::anyhow!(
+                    "geom_edge_lifts[{v}][{j}] has invalid source simplex {source}"
+                )
+            })?;
+
+            if source_label.owner != v {
+                bail!(
+                    "geom_edge_lifts[{v}][{j}] has source simplex {source} owned by {}, expected {v}",
+                    source_label.owner
+                );
+            }
+
+            let target_label = cert.graph.lbl.get(target).ok_or_else(|| {
+                anyhow::anyhow!(
+                    "geom_edge_lifts[{v}][{j}] has invalid target simplex {target}"
+                )
+            })?;
+
+            if target_label.owner != neighbor {
+                bail!(
+                    "geom_edge_lifts[{v}][{j}] targets simplex {target} owned by {}, expected geometric neighbor {neighbor}",
+                    target_label.owner
+                );
+            }
+
+            let source_neighbors = cert.graph.g.get(source).ok_or_else(|| {
+                anyhow::anyhow!(
+                    "geom_edge_lifts[{v}][{j}] has source simplex {source}, but the graph has only {} rows",
+                    cert.graph.g.len()
+                )
+            })?;
+
+            let target_local_index = source_neighbors
+                .iter()
+                .position(|&u| u == target)
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "geom_edge_lifts[{v}][{j}] contains ({source}, {target}), but {target} is not a neighbor of {source}"
+                    )
+                })?;
+
+            source_row.push(source);
+            target_row.push(target_local_index);
+        }
+
+        sources.push(source_row);
+        local_targets.push(target_row);
+    }
+
+    Ok((sources, local_targets))
+}
+
 fn write_root<W: Write>(w: &mut W, root: &Root) -> Result<()> {
     // root := simplex_id * (inverse_incident_map * (basis_vectors * (m_matrix * q_vectors)))
     write_int63_usize(w, root.simplex_id)?;
@@ -355,6 +460,11 @@ fn write_certificate_value<W: Write>(w: &mut W, cert: &Certificate) -> Result<()
     write_graph(w, &cert.graph)?;
 
     write_usize_matrix(w, &cert.neighbors)?;
+
+    let (geom_edge_sources, geom_edge_local_targets) =
+        split_geom_edge_lifts(cert)?;
+    write_usize_matrix(w, &geom_edge_sources)?;
+    write_usize_matrix(w, &geom_edge_local_targets)?;
 
     write_root(w, &cert.root)?;
 
