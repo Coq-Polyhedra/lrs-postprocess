@@ -4,6 +4,12 @@ use std::fs;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Certificate {
+    /// Explicit number of inequalities.
+    pub n_inequalities: usize,
+
+    /// Explicit ambient dimension.
+    pub dimension: usize,
+
     /// Inequalities A x <= b used by the certificate.
     pub inequalities: Vec<Inequality>,
 
@@ -80,6 +86,13 @@ pub struct SimplexGraph {
 pub struct Root {
     /// Graph-node index of the distinguished root simplex sigma*.
     pub simplex_id: usize,
+
+    /// Inverse map to the root owner incident list.
+    ///
+    /// This has length `n_inequalities`. If the root owner has incident list I,
+    /// then `inverse_incident_map[i]` is the position of `i` in I when `i in I`,
+    /// and is `n_inequalities` otherwise.
+    pub inverse_incident_map: Vec<usize>,
 
     /// Integer vectors f_1, ..., f_d.
     ///

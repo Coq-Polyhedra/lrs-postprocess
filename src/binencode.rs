@@ -204,23 +204,32 @@ fn sparse_vector_descr() -> Descr {
 }
 
 fn root_descr() -> Descr {
-    // root := simplex_id * (basis_vectors * (m_matrix * q_vectors))
+    // root := simplex_id * (inverse_incident_map * (basis_vectors * (m_matrix * q_vectors)))
     pair(
         Descr::Int63,
         pair(
-            array(array(Descr::BigZ)),
-            pair(array(array(Descr::BigZ)), array(sparse_vector_descr())),
+            array(Descr::Int63),
+            pair(
+                array(array(Descr::BigZ)),
+                pair(array(array(Descr::BigZ)), array(sparse_vector_descr())),
+            ),
         ),
     )
 }
 
 fn certificate_descr() -> Descr {
-    // certificate := inequalities * (items * (graph * (neighbors * root)))
+    // certificate := n_inequalities * (dimension * (inequalities * (items * (graph * (neighbors * root)))))
     pair(
-        array(inequality_descr()),
+        Descr::Int63,
         pair(
-            array(item_descr()),
-            pair(graph_descr(), pair(array(array(Descr::Int63)), root_descr())),
+            Descr::Int63,
+            pair(
+                array(inequality_descr()),
+                pair(
+                    array(item_descr()),
+                    pair(graph_descr(), pair(array(array(Descr::Int63)), root_descr())),
+                ),
+            ),
         ),
     )
 }
@@ -320,8 +329,9 @@ fn write_sparse_vector<W: Write>(w: &mut W, sparse: &[(usize, String)]) -> Resul
 }
 
 fn write_root<W: Write>(w: &mut W, root: &Root) -> Result<()> {
-    // root := simplex_id * (basis_vectors * (m_matrix * q_vectors))
+    // root := simplex_id * (inverse_incident_map * (basis_vectors * (m_matrix * q_vectors)))
     write_int63_usize(w, root.simplex_id)?;
+    write_usize_array(w, &root.inverse_incident_map)?;
     write_bigz_string_matrix(w, &root.basis_vectors)?;
     write_bigz_string_matrix(w, &root.m_matrix)?;
 
@@ -331,6 +341,9 @@ fn write_root<W: Write>(w: &mut W, root: &Root) -> Result<()> {
 }
 
 fn write_certificate_value<W: Write>(w: &mut W, cert: &Certificate) -> Result<()> {
+    write_int63_usize(w, cert.n_inequalities)?;
+    write_int63_usize(w, cert.dimension)?;
+
     let inequality_d = inequality_descr();
     write_array(w, &inequality_d, &cert.inequalities, |w, ineq| {
         write_inequality(w, ineq)

@@ -185,6 +185,31 @@ fn row_matrix_columns_from_global_rows(h: &HRep, rows: &[usize]) -> Result<Vec<V
 }
 
 
+fn check_explicit_sizes(h: &HRep, cert: &Certificate) -> Result<()> {
+    if cert.n_inequalities != h.a.len() {
+        bail!(
+            "certificate declares {} inequalities, but input has {}",
+            cert.n_inequalities,
+            h.a.len()
+        );
+    }
+    if cert.dimension != h.d {
+        bail!(
+            "certificate declares dimension {}, but input has dimension {}",
+            cert.dimension,
+            h.d
+        );
+    }
+    if cert.inequalities.len() != cert.n_inequalities {
+        bail!(
+            "certificate declares {} inequalities, but stores {} inequality rows",
+            cert.n_inequalities,
+            cert.inequalities.len()
+        );
+    }
+    Ok(())
+}
+
 fn check_certificate_inequalities(h: &HRep, cert: &Certificate) -> Result<()> {
     if cert.inequalities.len() != h.a.len() {
         bail!(
@@ -722,6 +747,46 @@ fn check_root(h: &HRep, cert: &Certificate) -> Result<()> {
         );
     }
 
+    if root.inverse_incident_map.len() != cert.n_inequalities {
+        bail!(
+            "root.inverse_incident_map has length {}, expected n={}",
+            root.inverse_incident_map.len(),
+            cert.n_inequalities
+        );
+    }
+
+    let sentinel = cert.n_inequalities;
+    for (global_row, &local_pos) in root.inverse_incident_map.iter().enumerate() {
+        if local_pos == sentinel {
+            if item.incident.binary_search(&global_row).is_ok() {
+                bail!(
+                    "root.inverse_incident_map[{global_row}] is the sentinel {sentinel}, but row {global_row} belongs to I(root owner {k0})"
+                );
+            }
+        } else {
+            if local_pos >= item.incident.len() {
+                bail!(
+                    "root.inverse_incident_map[{global_row}]={local_pos}, expected a local position below {} or sentinel {sentinel}",
+                    item.incident.len()
+                );
+            }
+            if item.incident[local_pos] != global_row {
+                bail!(
+                    "root.inverse_incident_map[{global_row}]={local_pos}, but I(root owner {k0})[{local_pos}]={}",
+                    item.incident[local_pos]
+                );
+            }
+        }
+    }
+    for (local_pos, &global_row) in item.incident.iter().enumerate() {
+        if root.inverse_incident_map[global_row] != local_pos {
+            bail!(
+                "root inverse map mismatch: I(root owner {k0})[{local_pos}]={global_row}, but inverse_incident_map[{global_row}]={}",
+                root.inverse_incident_map[global_row]
+            );
+        }
+    }
+
     let basis = parse_bigint_matrix(&root.basis_vectors, h.d, h.d, "root.basis_vectors")?;
     let m_matrix = parse_bigint_matrix(
         &root.m_matrix,
@@ -752,13 +817,14 @@ fn check_root(h: &HRep, cert: &Certificate) -> Result<()> {
     }
 
     for (root_pos, &row_id) in root_label.simplex.iter().enumerate() {
-        let local_pos = item.incident.binary_search(&row_id).map_err(|_| {
-            anyhow!(
+        let local_pos = root.inverse_incident_map[row_id];
+        if local_pos == sentinel {
+            bail!(
                 "root row {row_id} is not contained in I(root owner {})={:?}",
                 k0,
                 item.incident
-            )
-        })?;
+            );
+        }
 
         for j in 0..h.d {
             let val = &m_matrix[local_pos][j];
@@ -835,13 +901,20 @@ fn check_root(h: &HRep, cert: &Certificate) -> Result<()> {
         }
 
         for &row_id in &label.simplex {
-            let local_pos = item.incident.binary_search(&row_id).map_err(|_| {
-                anyhow!(
+            if row_id >= root.inverse_incident_map.len() {
+                bail!(
+                    "same-owner simplex graph node {label_id} contains row {row_id} out of range 0..{}",
+                    root.inverse_incident_map.len()
+                );
+            }
+            let local_pos = root.inverse_incident_map[row_id];
+            if local_pos == sentinel {
+                bail!(
                     "same-owner simplex graph node {label_id} contains row {row_id}, not in I(root owner {})={:?}",
                     k0,
                     item.incident
-                )
-            })?;
+                );
+            }
 
             let mut sum = BigInt::zero();
             for (coord, value) in &parsed {
@@ -877,6 +950,8 @@ pub fn check_certificate(ine_path: &str, certificate_path: &str) -> Result<()> {
     })?;
 
     let cert = time_check("read certificate", || read_certificate(certificate_path))?;
+
+    time_check("explicit size check", || check_explicit_sizes(&h, &cert))?;
 
     time_check("certificate inequality check", || {
         check_certificate_inequalities(&h, &cert).context("certificate inequality check failed")

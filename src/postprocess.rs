@@ -841,8 +841,20 @@ pub fn root_certificate(h: &HRep, items: &[VertexItem], graph: &SimplexGraph, k0
         q_vectors.push(q);
     }
 
+    let mut inverse_incident_map = vec![h.a.len(); h.a.len()];
+    for (local_pos, &row_id) in item.incident.iter().enumerate() {
+        if row_id >= h.a.len() {
+            bail!(
+                "root owner incident row {row_id} out of range 0..{}",
+                h.a.len()
+            );
+        }
+        inverse_incident_map[row_id] = local_pos;
+    }
+
     Ok(Root {
         simplex_id,
+        inverse_incident_map,
         basis_vectors: basis
             .iter()
             .map(|row| row.iter().map(ToString::to_string).collect())
@@ -905,6 +917,8 @@ pub fn to_certificate(h: &HRep, items: Vec<VertexItem>, graph: SimplexGraph, roo
     let inequalities = certificate_inequalities(h)?;
     let neighbors = build_item_neighbors(&graph, items.len())?;
     Ok(Certificate {
+        n_inequalities: h.a.len(),
+        dimension: h.d,
         inequalities,
         items,
         graph,

@@ -6,6 +6,7 @@ Time LoadData "__BIN_FILE__" As cert.
 
 Section Inspect.
 
+Let cert := snd (snd cert).
 Let ineq := fst cert.
 Let vert := fst (snd cert).
 Let graph := fst (fst (snd (snd cert))).
