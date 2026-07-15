@@ -1037,20 +1037,25 @@ fn build_full_dim_certificate(
         .map(|x| x.numer() * (&q / x.denom()))
         .collect::<Vec<_>>();
 
-    // R is stored row-wise, with columns q (w^j - v*).
+    // Store R by columns: r[j] is the integer direction numerator
+    // q (w^j - v*).
     let mut r = vec![vec![BigInt::zero(); d]; d];
     for j in 0..d {
         for k in 0..d {
             let w_num = selected_points[j][k].numer()
                 * (&q / selected_points[j][k].denom());
-            r[k][j] = w_num - &p[k];
+            r[j][k] = w_num - &p[k];
         }
     }
 
-    // One exact inversion after the independent columns have been selected.
-    let r_q = r
-        .iter()
-        .map(|row| row.iter().cloned().map(Q::from_integer).collect::<Vec<_>>())
+    // Convert the column representation to the usual row representation only
+    // for the exact inversion. The matrix entry R_{k,j} is r[j][k].
+    let r_q = (0..d)
+        .map(|k| {
+            (0..d)
+                .map(|j| Q::from_integer(r[j][k].clone()))
+                .collect::<Vec<_>>()
+        })
         .collect::<Vec<_>>();
     let inv = invert_matrix(&r_q).context(
         "pivot columns unexpectedly produced a singular integer direction matrix",

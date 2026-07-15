@@ -204,12 +204,12 @@ fn sparse_vector_descr() -> Descr {
 }
 
 fn full_dim_descr() -> Descr {
-    // full_dim := denominator * (point * (directions * left_inverse))
+    // full_dim := (point * denominator) * (direction_columns * left_inverse)
     pair(
-        Descr::BigN,
+        pair(array(Descr::BigZ), Descr::BigN),
         pair(
-            array(Descr::BigZ),
-            pair(array(array(Descr::BigZ)), array(array(Descr::BigZ))),
+            array(array(Descr::BigZ)),
+            array(array(Descr::BigZ)),
         ),
     )
 }
@@ -229,16 +229,25 @@ fn root_descr() -> Descr {
 }
 
 fn certificate_descr() -> Descr {
-    // The lift of geom_graph[v][j] is split into two parallel maps:
-    //   geom_edge_sources[v][j] = source simplex node,
-    //   geom_edge_targets[v][j] = local index of the target in graph[source].
+    // The geometric graph and its two parallel lift maps are grouped as:
+    //   geom := neighbors * (geom_edge_sources * geom_edge_local_targets)
+    // where
+    //   geom_edge_sources[v][j] = source simplex node, and
+    //   geom_edge_local_targets[v][j] = local index of the target in graph[source].
+    //
     // certificate := n_inequalities *
     //   (dimension *
     //    (inequalities *
     //     (items *
     //      (graph *
-    //       (neighbors *
-    //        (geom_edge_sources * (geom_edge_targets * root)))))))
+    //       (geom *
+    //        (full_dim * root))))))
+    let int_matrix = || array(array(Descr::Int63));
+    let geom_descr = pair(
+        int_matrix(),
+        pair(int_matrix(), int_matrix()),
+    );
+
     pair(
         Descr::Int63,
         pair(
@@ -250,14 +259,8 @@ fn certificate_descr() -> Descr {
                     pair(
                         graph_descr(),
                         pair(
-                            array(array(Descr::Int63)),
-                            pair(
-                                array(array(Descr::Int63)),
-                                pair(
-                                    array(array(Descr::Int63)),
-                                    pair(full_dim_descr(), root_descr()),
-                                ),
-                            ),
+                            geom_descr,
+                            pair(full_dim_descr(), root_descr()),
                         ),
                     ),
                 ),
@@ -448,9 +451,9 @@ fn split_geom_edge_lifts(
 }
 
 fn write_full_dim<W: Write>(w: &mut W, full_dim: &FullDimCertificate) -> Result<()> {
-    // full_dim := denominator * (point * (directions * left_inverse))
-    write_bign_str(w, &full_dim.denominator)?;
+    // full_dim := (point * denominator) * (direction_columns * left_inverse)
     write_bigz_string_array(w, &full_dim.point)?;
+    write_bign_str(w, &full_dim.denominator)?;
     write_bigz_string_matrix(w, &full_dim.directions)?;
     write_bigz_string_matrix(w, &full_dim.left_inverse)?;
     Ok(())
@@ -482,8 +485,8 @@ fn write_certificate_value<W: Write>(w: &mut W, cert: &Certificate) -> Result<()
 
     write_graph(w, &cert.graph)?;
 
+    // geom := neighbors * (geom_edge_sources * geom_edge_local_targets)
     write_usize_matrix(w, &cert.neighbors)?;
-
     let (geom_edge_sources, geom_edge_local_targets) =
         split_geom_edge_lifts(cert)?;
     write_usize_matrix(w, &geom_edge_sources)?;

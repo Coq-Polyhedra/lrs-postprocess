@@ -799,8 +799,7 @@ fn check_full_dim(cert: &Certificate) -> Result<()> {
         }
 
         for j in 0..d {
-            let direction_dot = (0..d)
-                .fold(BigInt::zero(), |acc, k| acc + &a[k] * &r[k][j]);
+            let direction_dot = dot_bigint(&a, &r[j]);
             let value = &base + direction_dot;
             if value > rhs {
                 bail!(
@@ -812,8 +811,7 @@ fn check_full_dim(cert: &Certificate) -> Result<()> {
 
     for i in 0..d {
         for j in 0..d {
-            let product = (0..d)
-                .fold(BigInt::zero(), |acc, k| acc + &u[i][k] * &r[k][j]);
+            let product = dot_bigint(&u[i], &r[j]);
             if i == j {
                 if product.is_zero() {
                     bail!(

@@ -100,7 +100,8 @@ pub struct FullDimCertificate {
     /// Integer numerator p of the feasible base point x0 = p / q.
     pub point: Vec<String>,
 
-    /// Integer d x d matrix R. Its columns are the direction numerators r^j.
+    /// The d integer direction numerators r^j. Each outer entry is one
+    /// column of R, so directions[j][k] = R_{k,j}.
     pub directions: Vec<Vec<String>>,
 
     /// Integer d x d matrix U, stored by rows, such that U R is diagonal
