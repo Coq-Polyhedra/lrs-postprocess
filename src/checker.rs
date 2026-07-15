@@ -761,6 +761,76 @@ fn parse_certificate_integer_rows(cert: &Certificate, d: usize) -> Result<Vec<Ve
         .collect()
 }
 
+
+fn check_full_dim(cert: &Certificate) -> Result<()> {
+    let d = cert.dimension;
+    let fd = &cert.full_dim;
+
+    let q = parse_bigint_decimal(&fd.denominator, "full_dim.denominator")?;
+    if q <= BigInt::zero() {
+        bail!("full_dim.denominator must be positive, got {q}");
+    }
+
+    let p = parse_bigint_vec(&fd.point, "full_dim.point")?;
+    if p.len() != d {
+        bail!(
+            "full_dim.point has length {}, expected dimension {d}",
+            p.len()
+        );
+    }
+    let r = parse_bigint_matrix(&fd.directions, d, d, "full_dim.directions")?;
+    let u = parse_bigint_matrix(&fd.left_inverse, d, d, "full_dim.left_inverse")?;
+
+    for (ineq_id, ineq) in cert.inequalities.iter().enumerate() {
+        let a = parse_bigint_vec(&ineq.a, &format!("inequality {ineq_id}.a"))?;
+        if a.len() != d {
+            bail!(
+                "inequality {ineq_id} has {} coefficients, expected dimension {d}",
+                a.len()
+            );
+        }
+        let b = parse_bigint_decimal(&ineq.b, &format!("inequality {ineq_id}.b"))?;
+        let rhs = &q * b;
+        let base = dot_bigint(&a, &p);
+        if base > rhs {
+            bail!(
+                "full-dimensionality base point violates inequality {ineq_id}: {base} > {rhs}"
+            );
+        }
+
+        for j in 0..d {
+            let direction_dot = (0..d)
+                .fold(BigInt::zero(), |acc, k| acc + &a[k] * &r[k][j]);
+            let value = &base + direction_dot;
+            if value > rhs {
+                bail!(
+                    "full-dimensionality point x0+y^{j} violates inequality {ineq_id}: {value} > {rhs}"
+                );
+            }
+        }
+    }
+
+    for i in 0..d {
+        for j in 0..d {
+            let product = (0..d)
+                .fold(BigInt::zero(), |acc, k| acc + &u[i][k] * &r[k][j]);
+            if i == j {
+                if product.is_zero() {
+                    bail!(
+                        "full_dim.left_inverse * full_dim.directions has zero diagonal entry at ({i},{j})"
+                    );
+                }
+            } else if !product.is_zero() {
+                bail!(
+                    "full_dim.left_inverse * full_dim.directions is not diagonal: entry ({i},{j}) is {product}"
+                );
+            }
+        }
+    }
+
+    Ok(())
+}
+
 fn check_root(h: &HRep, cert: &Certificate) -> Result<()> {
     let root = &cert.root;
 
@@ -1013,6 +1083,10 @@ pub fn check_certificate(ine_path: &str, certificate_path: &str) -> Result<()> {
 
     time_check("simplex graph check", || {
         check_simplex_graph(&h, &cert).context("simplex graph check failed")
+    })?;
+
+    time_check("full-dimensionality check", || {
+        check_full_dim(&cert).context("full-dimensionality check failed")
     })?;
 
     time_check("root check", || {

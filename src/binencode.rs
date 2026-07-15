@@ -6,7 +6,7 @@ use std::fs::File;
 use std::io::{BufWriter, Write};
 use std::path::Path;
 
-use crate::certificate::{read_certificate, Certificate, GraphLabel, Inequality, Root, SimplexGraph, VertexCoords, VertexItem};
+use crate::certificate::{read_certificate, Certificate, FullDimCertificate, GraphLabel, Inequality, Root, SimplexGraph, VertexCoords, VertexItem};
 
 #[derive(Clone, Debug)]
 enum Descr {
@@ -203,6 +203,17 @@ fn sparse_vector_descr() -> Descr {
     array(sparse_entry_descr())
 }
 
+fn full_dim_descr() -> Descr {
+    // full_dim := denominator * (point * (directions * left_inverse))
+    pair(
+        Descr::BigN,
+        pair(
+            array(Descr::BigZ),
+            pair(array(array(Descr::BigZ)), array(array(Descr::BigZ))),
+        ),
+    )
+}
+
 fn root_descr() -> Descr {
     // root := simplex_id * (inverse_incident_map * (basis_vectors * (m_matrix * q_vectors)))
     pair(
@@ -242,7 +253,10 @@ fn certificate_descr() -> Descr {
                             array(array(Descr::Int63)),
                             pair(
                                 array(array(Descr::Int63)),
-                                pair(array(array(Descr::Int63)), root_descr()),
+                                pair(
+                                    array(array(Descr::Int63)),
+                                    pair(full_dim_descr(), root_descr()),
+                                ),
                             ),
                         ),
                     ),
@@ -433,6 +447,15 @@ fn split_geom_edge_lifts(
     Ok((sources, local_targets))
 }
 
+fn write_full_dim<W: Write>(w: &mut W, full_dim: &FullDimCertificate) -> Result<()> {
+    // full_dim := denominator * (point * (directions * left_inverse))
+    write_bign_str(w, &full_dim.denominator)?;
+    write_bigz_string_array(w, &full_dim.point)?;
+    write_bigz_string_matrix(w, &full_dim.directions)?;
+    write_bigz_string_matrix(w, &full_dim.left_inverse)?;
+    Ok(())
+}
+
 fn write_root<W: Write>(w: &mut W, root: &Root) -> Result<()> {
     // root := simplex_id * (inverse_incident_map * (basis_vectors * (m_matrix * q_vectors)))
     write_int63_usize(w, root.simplex_id)?;
@@ -466,6 +489,7 @@ fn write_certificate_value<W: Write>(w: &mut W, cert: &Certificate) -> Result<()
     write_usize_matrix(w, &geom_edge_sources)?;
     write_usize_matrix(w, &geom_edge_local_targets)?;
 
+    write_full_dim(w, &cert.full_dim)?;
     write_root(w, &cert.root)?;
 
     Ok(())

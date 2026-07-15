@@ -33,6 +33,9 @@ pub struct Certificate {
     /// `neighbors`.
     pub geom_edge_lifts: Vec<Vec<(usize, usize)>>,
 
+    /// Integer certificate that the polyhedron is full-dimensional.
+    pub full_dim: FullDimCertificate,
+
     pub root: Root,
 }
 
@@ -86,6 +89,23 @@ pub struct SimplexGraph {
 
     /// Labels of graph nodes. Each entry contains the global simplex and its owner item.
     pub lbl: Vec<GraphLabel>,
+}
+
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FullDimCertificate {
+    /// Common positive denominator q.
+    pub denominator: String,
+
+    /// Integer numerator p of the feasible base point x0 = p / q.
+    pub point: Vec<String>,
+
+    /// Integer d x d matrix R. Its columns are the direction numerators r^j.
+    pub directions: Vec<Vec<String>>,
+
+    /// Integer d x d matrix U, stored by rows, such that U R is diagonal
+    /// with nonzero diagonal entries.
+    pub left_inverse: Vec<Vec<String>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

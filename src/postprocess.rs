@@ -5,7 +5,7 @@ use num_traits::{One, Signed, Zero};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fs;
 
-use crate::certificate::{Certificate, GraphLabel, Inequality, Root, SimplexGraph, VertexCoords, VertexItem};
+use crate::certificate::{Certificate, FullDimCertificate, GraphLabel, Inequality, Root, SimplexGraph, VertexCoords, VertexItem};
 use crate::numerics::{dot, identity, invert_matrix, mat_mul, parse_q, q_to_string, Q};
 
 #[derive(Debug, Clone)]
@@ -885,6 +885,210 @@ pub fn root_certificate(h: &HRep, items: &[VertexItem], graph: &SimplexGraph, k0
 }
 
 
+
+fn vertex_coords_to_q(vertex: &VertexCoords, d: usize) -> Result<Vec<Q>> {
+    if vertex.num.len() != d {
+        bail!(
+            "vertex has {} coordinates, expected dimension {d}",
+            vertex.num.len()
+        );
+    }
+    let den = BigInt::parse_bytes(vertex.den.trim().as_bytes(), 10)
+        .ok_or_else(|| anyhow!("invalid vertex denominator `{}`", vertex.den))?;
+    if den <= BigInt::zero() {
+        bail!("vertex denominator must be positive, got {den}");
+    }
+    vertex
+        .num
+        .iter()
+        .enumerate()
+        .map(|(j, x)| {
+            let num = BigInt::parse_bytes(x.trim().as_bytes(), 10)
+                .ok_or_else(|| anyhow!("invalid vertex numerator at coordinate {j}: `{x}`"))?;
+            Ok(Q::new(num, den.clone()))
+        })
+        .collect()
+}
+
+fn pivot_columns_by_row_echelon(matrix: &mut [Vec<Q>]) -> Vec<usize> {
+    if matrix.is_empty() {
+        return Vec::new();
+    }
+
+    let nrows = matrix.len();
+    let ncols = matrix[0].len();
+    let mut pivot_row = 0usize;
+    let mut pivot_columns = Vec::with_capacity(nrows);
+
+    for col in 0..ncols {
+        if pivot_row == nrows {
+            break;
+        }
+
+        let Some(pivot) = (pivot_row..nrows).find(|&r| !matrix[r][col].is_zero()) else {
+            continue;
+        };
+
+        matrix.swap(pivot_row, pivot);
+        let pivot_value = matrix[pivot_row][col].clone();
+
+        // It is enough to eliminate below the pivot.  We do not normalize the
+        // pivot row, which avoids many rational divisions and gcd reductions.
+        for r in (pivot_row + 1)..nrows {
+            if matrix[r][col].is_zero() {
+                continue;
+            }
+
+            let factor = matrix[r][col].clone() / pivot_value.clone();
+            matrix[r][col] = Q::zero();
+            for c in (col + 1)..ncols {
+                let correction = factor.clone() * matrix[pivot_row][c].clone();
+                matrix[r][c] -= correction;
+            }
+        }
+
+        pivot_columns.push(col);
+        pivot_row += 1;
+    }
+
+    pivot_columns
+}
+
+fn build_full_dim_certificate(
+    items: &[VertexItem],
+    neighbors: &[Vec<usize>],
+    root_owner: usize,
+    d: usize,
+) -> Result<FullDimCertificate> {
+    let root_item = items.get(root_owner).ok_or_else(|| {
+        anyhow!(
+            "root owner {root_owner} is out of bounds for {} items",
+            items.len()
+        )
+    })?;
+    let root_neighbors = neighbors.get(root_owner).ok_or_else(|| {
+        anyhow!(
+            "missing geometric-neighbor list for root owner {root_owner}"
+        )
+    })?;
+
+    if root_neighbors.len() < d {
+        bail!(
+            "root vertex {root_owner} has only {} geometric neighbors, fewer than dimension {d}",
+            root_neighbors.len()
+        );
+    }
+
+    let x0 = vertex_coords_to_q(&root_item.vertex, d)?;
+
+    // Build once the d x deg(v*) rational matrix whose columns are w - v*.
+    let mut edge_matrix = vec![vec![Q::zero(); root_neighbors.len()]; d];
+    for (col, &neighbor) in root_neighbors.iter().enumerate() {
+        let w_item = items.get(neighbor).ok_or_else(|| {
+            anyhow!(
+                "neighbors[{root_owner}] contains item {neighbor}, but there are only {} items",
+                items.len()
+            )
+        })?;
+        let w = vertex_coords_to_q(&w_item.vertex, d)?;
+        for row in 0..d {
+            edge_matrix[row][col] = w[row].clone() - x0[row].clone();
+        }
+    }
+
+    // A single row-echelon decomposition gives pivot columns of the original
+    // matrix, hence d linearly independent neighbor directions.
+    let pivot_columns = pivot_columns_by_row_echelon(&mut edge_matrix);
+    if pivot_columns.len() < d {
+        bail!(
+            "neighbor directions at root vertex {root_owner} have rank {}, expected {d}",
+            pivot_columns.len()
+        );
+    }
+
+    let selected_neighbors = pivot_columns
+        .into_iter()
+        .take(d)
+        .map(|col| root_neighbors[col])
+        .collect::<Vec<_>>();
+
+    // Convert only the selected d neighbors to rational coordinates, then
+    // clear denominators once for v* and those neighbors.
+    let selected_points = selected_neighbors
+        .iter()
+        .map(|&neighbor| vertex_coords_to_q(&items[neighbor].vertex, d))
+        .collect::<Result<Vec<_>>>()?;
+
+    let mut q = BigInt::one();
+    for coord in &x0 {
+        q = q.lcm(coord.denom());
+    }
+    for x in &selected_points {
+        for coord in x {
+            q = q.lcm(coord.denom());
+        }
+    }
+    if q <= BigInt::zero() {
+        bail!("internal error: common denominator for full-dimensionality certificate is {q}");
+    }
+
+    let p = x0
+        .iter()
+        .map(|x| x.numer() * (&q / x.denom()))
+        .collect::<Vec<_>>();
+
+    // R is stored row-wise, with columns q (w^j - v*).
+    let mut r = vec![vec![BigInt::zero(); d]; d];
+    for j in 0..d {
+        for k in 0..d {
+            let w_num = selected_points[j][k].numer()
+                * (&q / selected_points[j][k].denom());
+            r[k][j] = w_num - &p[k];
+        }
+    }
+
+    // One exact inversion after the independent columns have been selected.
+    let r_q = r
+        .iter()
+        .map(|row| row.iter().cloned().map(Q::from_integer).collect::<Vec<_>>())
+        .collect::<Vec<_>>();
+    let inv = invert_matrix(&r_q).context(
+        "pivot columns unexpectedly produced a singular integer direction matrix",
+    )?;
+
+    let mut scale = BigInt::one();
+    for row in &inv {
+        for x in row {
+            scale = scale.lcm(x.denom());
+        }
+    }
+    if scale <= BigInt::zero() {
+        bail!("internal error: inverse-matrix denominator scale is {scale}");
+    }
+
+    let u = inv
+        .iter()
+        .map(|row| {
+            row.iter()
+                .map(|x| x.numer() * (&scale / x.denom()))
+                .collect::<Vec<_>>()
+        })
+        .collect::<Vec<_>>();
+
+    Ok(FullDimCertificate {
+        denominator: q.to_string(),
+        point: p.iter().map(ToString::to_string).collect(),
+        directions: r
+            .iter()
+            .map(|row| row.iter().map(ToString::to_string).collect())
+            .collect(),
+        left_inverse: u
+            .iter()
+            .map(|row| row.iter().map(ToString::to_string).collect())
+            .collect(),
+    })
+}
+
 fn clear_rationals_to_integer_row(values: &[String]) -> Result<Vec<String>> {
     let mut nums = Vec::<BigInt>::with_capacity(values.len());
     let mut dens = Vec::<BigInt>::with_capacity(values.len());
@@ -934,6 +1138,12 @@ pub fn to_certificate(h: &HRep, items: Vec<VertexItem>, graph: SimplexGraph, roo
     let inequalities = certificate_inequalities(h)?;
     let (neighbors, geom_edge_lifts) =
         build_item_neighbors_and_lifts(&graph, items.len())?;
+    let root_owner = graph
+        .lbl
+        .get(root.simplex_id)
+        .ok_or_else(|| anyhow!("root simplex id {} is out of bounds", root.simplex_id))?
+        .owner;
+    let full_dim = build_full_dim_certificate(&items, &neighbors, root_owner, h.d)?;
     Ok(Certificate {
         n_inequalities: h.a.len(),
         dimension: h.d,
@@ -942,6 +1152,7 @@ pub fn to_certificate(h: &HRep, items: Vec<VertexItem>, graph: SimplexGraph, roo
         graph,
         neighbors,
         geom_edge_lifts,
+        full_dim,
         root,
     })
 }
