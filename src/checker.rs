@@ -1,1107 +1,935 @@
-use anyhow::{anyhow, bail, Context, Result};
+use anyhow::{anyhow, Context, Result};
 use num_bigint::{BigInt, Sign};
 use num_integer::Integer;
 use num_traits::{One, Signed, Zero};
+use std::collections::VecDeque;
 use std::time::Instant;
 
-use crate::certificate::{read_certificate, Certificate, Root, VertexCoords};
-use crate::numerics::{dot, mat_mul, parse_q, q_to_string, Q};
+use crate::certificate::{read_certificate, Certificate};
+use crate::numerics::q_to_string;
 use crate::postprocess::{parse_lrs_hrep, HRep};
 
-
-fn parse_bigint_decimal(s: &str, what: &str) -> Result<BigInt> {
+fn parse_bigint(s: &str) -> Option<BigInt> {
     BigInt::parse_bytes(s.trim().as_bytes(), 10)
-        .ok_or_else(|| anyhow!("invalid integer `{}` for {what}", s.trim()))
 }
 
-fn check_vertex_coords(v: &VertexCoords, expected_dim: usize, what: &str) -> Result<()> {
-    if v.num.len() != expected_dim {
-        bail!(
-            "{what}: vertex numerator vector has dimension {}, expected {}",
-            v.num.len(),
-            expected_dim
-        );
-    }
-
-    for (i, x) in v.num.iter().enumerate() {
-        let _ = parse_bigint_decimal(x, &format!("{what}: vertex numerator {i}"))?;
-    }
-
-    let den = parse_bigint_decimal(&v.den, &format!("{what}: vertex denominator"))?;
-    if den.sign() != Sign::Plus {
-        bail!("{what}: vertex denominator must be positive, got {}", v.den);
-    }
-
-    Ok(())
+fn parse_bigint_vec(xs: &[String]) -> Option<Vec<BigInt>> {
+    xs.iter().map(|x| parse_bigint(x)).collect()
 }
 
-fn parse_q_vec(v: &[String]) -> Result<Vec<Q>> {
-    v.iter().map(|s| parse_q(s)).collect()
+fn parse_bigint_matrix(
+    matrix: &[Vec<String>],
+    rows: usize,
+    columns: usize,
+) -> Option<Vec<Vec<BigInt>>> {
+    if matrix.len() != rows || matrix.iter().any(|row| row.len() != columns) {
+        return None;
+    }
+    matrix.iter().map(|row| parse_bigint_vec(row)).collect()
 }
 
-fn parse_q_matrix(m: &[Vec<String>]) -> Result<Vec<Vec<Q>>> {
-    m.iter().map(|row| parse_q_vec(row)).collect()
-}
+type ParsedInequality = (Vec<BigInt>, BigInt);
 
-fn parse_rational_parts(s: &str) -> Result<(BigInt, BigInt)> {
-    let s = s.trim();
-
-    let (mut num, mut den) = if let Some((a, b)) = s.split_once('/') {
-        let num = BigInt::parse_bytes(a.trim().as_bytes(), 10)
-            .ok_or_else(|| anyhow!("invalid rational numerator `{}`", a.trim()))?;
-        let den = BigInt::parse_bytes(b.trim().as_bytes(), 10)
-            .ok_or_else(|| anyhow!("invalid rational denominator `{}`", b.trim()))?;
-        (num, den)
-    } else {
-        let num = BigInt::parse_bytes(s.as_bytes(), 10)
-            .ok_or_else(|| anyhow!("invalid integer rational `{s}`"))?;
-        (num, BigInt::one())
-    };
-
-    if den.is_zero() {
-        bail!("invalid rational `{s}` with zero denominator");
-    }
-
-    if den.sign() == Sign::Minus {
-        num = -num;
-        den = -den;
-    }
-
-    let g = num.abs().gcd(&den);
-    num /= &g;
-    den /= &g;
-
-    Ok((num, den))
-}
-
-fn clear_rationals_to_integer_row(values: &[String]) -> Result<Vec<BigInt>> {
-    let mut nums = Vec::<BigInt>::with_capacity(values.len());
-    let mut dens = Vec::<BigInt>::with_capacity(values.len());
-
-    for s in values {
-        let (num, den) = parse_rational_parts(s)
-            .with_context(|| format!("failed to parse rational `{s}` while clearing denominators"))?;
-        nums.push(num);
-        dens.push(den);
-    }
-
-    let lcm = dens.iter().fold(BigInt::one(), |acc, den| acc.lcm(den));
-
-    Ok(nums
+fn parse_inequalities(cert: &Certificate) -> Option<Vec<ParsedInequality>> {
+    cert.inequalities
         .iter()
-        .zip(&dens)
-        .map(|(num, den)| num * (&lcm / den))
-        .collect())
+        .map(|inequality| {
+            Some((
+                parse_bigint_vec(&inequality.a)?,
+                parse_bigint(&inequality.b)?,
+            ))
+        })
+        .collect()
 }
 
-fn integer_inequality_from_hrep(h: &HRep, i: usize) -> Result<(Vec<BigInt>, BigInt)> {
-    let mut values = h.a[i]
-        .iter()
-        .map(q_to_string)
-        .collect::<Vec<_>>();
-    values.push(q_to_string(&h.b[i]));
-
-    let cleared = clear_rationals_to_integer_row(&values)?;
-    let b = cleared
-        .last()
-        .cloned()
-        .ok_or_else(|| anyhow!("empty inequality row after clearing denominators"))?;
-    let a = cleared[..cleared.len() - 1].to_vec();
-    Ok((a, b))
+fn dot(x: &[BigInt], y: &[BigInt]) -> Option<BigInt> {
+    if x.len() != y.len() {
+        return None;
+    }
+    Some(
+        x.iter()
+            .zip(y)
+            .fold(BigInt::zero(), |acc, (xi, yi)| acc + xi * yi),
+    )
 }
 
-fn identity(n: usize) -> Vec<Vec<Q>> {
-    let mut id = vec![vec![Q::zero(); n]; n];
-
-    for i in 0..n {
-        id[i][i] = Q::one();
+fn sparse_dot(weight: &[(usize, String)], x: &[BigInt]) -> Option<BigInt> {
+    let mut result = BigInt::zero();
+    for (i, value) in weight {
+        let coefficient = parse_bigint(value)?;
+        result += coefficient * x.get(*i)?;
     }
-
-    id
+    Some(result)
 }
 
-fn strictly_sorted_len(v: &[usize]) -> Result<usize> {
-    for i in 1..v.len() {
-        if v[i - 1] >= v[i] {
-            bail!(
-                "expected strictly sorted list, but found {} followed by {} at positions {} and {}",
-                v[i - 1],
-                v[i],
-                i - 1,
-                i
-            );
-        }
-    }
-
-    Ok(v.len())
+fn strictly_sorted(xs: &[usize]) -> bool {
+    xs.windows(2).all(|w| w[0] < w[1])
 }
 
-fn contains_sorted(v: &[usize], x: usize) -> bool {
-    v.binary_search(&x).is_ok()
+fn strictly_lexicographically_sorted(xs: &[Vec<usize>]) -> bool {
+    xs.windows(2).all(|w| w[0] < w[1])
 }
 
-fn lex_less(a: &[usize], b: &[usize]) -> bool {
-    a < b
-}
-
-fn check_strictly_lex_sorted(xs: &[Vec<usize>], what: &str) -> Result<()> {
-    for i in 1..xs.len() {
-        if !lex_less(&xs[i - 1], &xs[i]) {
-            bail!(
-                "{what} is not strictly lexicographically sorted at positions {} and {}: {:?} then {:?}",
-                i - 1,
-                i,
-                xs[i - 1],
-                xs[i]
-            );
-        }
-    }
-
-    Ok(())
-}
-
-fn row_matrix_columns_from_global_rows(h: &HRep, rows: &[usize]) -> Result<Vec<Vec<Q>>> {
-    if strictly_sorted_len(rows)? != h.d {
-        bail!(
-            "expected {} strictly sorted global rows for a full-dimensional simplex, got {}",
-            h.d,
-            rows.len()
-        );
-    }
-
-    let mut m = vec![vec![Q::zero(); h.d]; h.d];
-
-    for (col, &j) in rows.iter().enumerate() {
-        if j >= h.a.len() {
-            bail!("global row index {j} out of range 0..{}", h.a.len());
-        }
-
-        for row in 0..h.d {
-            m[row][col] = h.a[j][row].clone();
-        }
-    }
-
-    Ok(m)
-}
-
-
-fn check_explicit_sizes(h: &HRep, cert: &Certificate) -> Result<()> {
-    if cert.n_inequalities != h.a.len() {
-        bail!(
-            "certificate declares {} inequalities, but input has {}",
-            cert.n_inequalities,
-            h.a.len()
-        );
-    }
-    if cert.dimension != h.d {
-        bail!(
-            "certificate declares dimension {}, but input has dimension {}",
-            cert.dimension,
-            h.d
-        );
-    }
-    if cert.inequalities.len() != cert.n_inequalities {
-        bail!(
-            "certificate declares {} inequalities, but stores {} inequality rows",
-            cert.n_inequalities,
-            cert.inequalities.len()
-        );
-    }
-    Ok(())
-}
-
-fn check_certificate_inequalities(h: &HRep, cert: &Certificate) -> Result<()> {
-    if cert.inequalities.len() != h.a.len() {
-        bail!(
-            "certificate contains {} inequalities, but input has {}",
-            cert.inequalities.len(),
-            h.a.len()
-        );
-    }
-
-    for (i, ineq) in cert.inequalities.iter().enumerate() {
-        if ineq.a.len() != h.d {
-            bail!(
-                "certificate inequality {i} has {} coefficients, expected d={}",
-                ineq.a.len(),
-                h.d
-            );
-        }
-
-        let a = ineq
-            .a
-            .iter()
-            .enumerate()
-            .map(|(j, s)| parse_bigint_decimal(s, &format!("inequality {i} coefficient {j}")))
-            .collect::<Result<Vec<_>>>()?;
-        let b = parse_bigint_decimal(&ineq.b, &format!("inequality {i} rhs"))?;
-
-        let (expected_a, expected_b) = integer_inequality_from_hrep(h, i)
-            .with_context(|| format!("failed to clear input inequality {i}"))?;
-
-        if a != expected_a {
-            bail!(
-                "certificate inequality {i} integer coefficients do not match input H-representation after clearing denominators"
-            );
-        }
-
-        if b != expected_b {
-            bail!(
-                "certificate inequality {i} integer rhs does not match input H-representation after clearing denominators"
-            );
-        }
-    }
-
-    Ok(())
-}
-
-fn check_items_basic(h: &HRep, cert: &Certificate) -> Result<()> {
-    for (k, item) in cert.items.iter().enumerate() {
-        check_vertex_coords(&item.vertex, h.d, &format!("item {k}"))
-            .with_context(|| format!("item {k}: invalid vertex coordinates"))?;
-
-        strictly_sorted_len(&item.incident)
-            .with_context(|| format!("item {k}: incident list is not strictly sorted"))?;
-
-        for (pos, &j) in item.incident.iter().enumerate() {
-            if j >= h.a.len() {
-                bail!(
-                    "item {k}: incident[{pos}]={j} out of range 0..{}",
-                    h.a.len()
-                );
-            }
-        }
-    }
-
-    for k in 1..cert.items.len() {
-        if cert.items[k - 1].incident >= cert.items[k].incident {
-            bail!(
-                "items are not strictly lexicographically sorted by incident sets at positions {} and {}: {:?} then {:?}",
-                k - 1,
-                k,
-                cert.items[k - 1].incident,
-                cert.items[k].incident
-            );
-        }
-    }
-
-    Ok(())
-}
-
-
-fn sorted_subset(a: &[usize], b: &[usize]) -> bool {
-    // Assumes both are strictly sorted.
+fn sorted_subset(xs: &[usize], ys: &[usize]) -> bool {
     let mut i = 0;
     let mut j = 0;
-
-    while i < a.len() && j < b.len() {
-        if a[i] == b[j] {
+    while i < xs.len() && j < ys.len() {
+        if xs[i] == ys[j] {
             i += 1;
             j += 1;
-        } else if a[i] > b[j] {
+        } else if xs[i] > ys[j] {
             j += 1;
         } else {
             return false;
         }
     }
-
-    i == a.len()
+    i == xs.len()
 }
 
-fn check_incident_sets_antichain(cert: &Certificate) -> Result<()> {
-    let mut sizes = Vec::with_capacity(cert.items.len());
-
-    for (k, item) in cert.items.iter().enumerate() {
-        let size = strictly_sorted_len(&item.incident)
-            .with_context(|| format!("item {k}: incident list is not strictly sorted"))?;
-        sizes.push(size);
-    }
-
-    for i in 0..cert.items.len() {
-        for j in (i + 1)..cert.items.len() {
-            let si = sizes[i];
-            let sj = sizes[j];
-
-            if si < sj {
-                if sorted_subset(&cert.items[i].incident, &cert.items[j].incident) {
-                    bail!(
-                        "incident set of item {i} is strictly contained in incident set of item {j}"
-                    );
-                }
-            } else if sj < si {
-                if sorted_subset(&cert.items[j].incident, &cert.items[i].incident) {
-                    bail!(
-                        "incident set of item {j} is strictly contained in incident set of item {i}"
-                    );
-                }
-            }
-            // If si == sj, strict inclusion is impossible.
+fn sorted_difference(xs: &[usize], ys: &[usize]) -> Vec<usize> {
+    let mut i = 0;
+    let mut j = 0;
+    let mut result = Vec::new();
+    while i < xs.len() && j < ys.len() {
+        if xs[i] == ys[j] {
+            i += 1;
+            j += 1;
+        } else if xs[i] < ys[j] {
+            result.push(xs[i]);
+            i += 1;
+        } else {
+            j += 1;
         }
     }
-
-    Ok(())
+    result.extend_from_slice(&xs[i..]);
+    result
 }
 
-fn check_graph_labels(h: &HRep, cert: &Certificate) -> Result<()> {
-    if cert.graph.g.len() != cert.graph.lbl.len() {
-        bail!(
-            "graph.g has length {}, but graph.lbl has length {}",
-            cert.graph.g.len(),
-            cert.graph.lbl.len()
-        );
+fn is_undirected(graph: &[Vec<usize>]) -> bool {
+    graph.iter().enumerate().all(|(i, neighbors)| {
+        neighbors.iter().all(|&j| {
+            graph
+                .get(j)
+                .is_some_and(|reverse_neighbors| reverse_neighbors.contains(&i))
+        })
+    })
+}
+
+fn parse_rational_parts(s: &str) -> Option<(BigInt, BigInt)> {
+    let s = s.trim();
+    let (mut numerator, mut denominator) = if let Some((a, b)) = s.split_once('/') {
+        (parse_bigint(a)?, parse_bigint(b)?)
+    } else {
+        (parse_bigint(s)?, BigInt::one())
+    };
+
+    if denominator.is_zero() {
+        return None;
+    }
+    if denominator.sign() == Sign::Minus {
+        numerator = -numerator;
+        denominator = -denominator;
     }
 
-    let labels = cert
-        .graph
-        .lbl
+    let gcd = numerator.abs().gcd(&denominator);
+    Some((numerator / &gcd, denominator / gcd))
+}
+
+fn clear_rationals_to_integer_row(values: &[String]) -> Option<Vec<BigInt>> {
+    let parts = values
         .iter()
-        .map(|label| label.simplex.clone())
-        .collect::<Vec<_>>();
-
-    check_strictly_lex_sorted(&labels, "graph.lbl[*].simplex")?;
-
-    for (node, label) in cert.graph.lbl.iter().enumerate() {
-        let lbl = &label.simplex;
-
-        let len = strictly_sorted_len(lbl)
-            .with_context(|| format!("graph.lbl[{node}].simplex is not strictly sorted"))?;
-
-        if len != h.d {
-            bail!(
-                "graph.lbl[{node}].simplex has length {}, expected d={}",
-                len,
-                h.d
-            );
-        }
-
-        for (pos, &j) in lbl.iter().enumerate() {
-            if j >= h.a.len() {
-                bail!(
-                    "graph.lbl[{node}].simplex[{pos}]={j} out of range 0..{}",
-                    h.a.len()
-                );
-            }
-        }
-
-        let owner = label.owner;
-        let item = cert.items.get(owner).ok_or_else(|| {
-            anyhow!(
-                "graph.lbl[{node}].owner={owner} out of range 0..{}",
-                cert.items.len()
-            )
-        })?;
-
-        if !sorted_subset(lbl, &item.incident) {
-            bail!(
-                "graph.lbl[{node}].simplex={:?} is not contained in I(owner={})={:?}",
-                lbl,
-                owner,
-                item.incident
-            );
-        }
-    }
-
-    Ok(())
+        .map(|value| parse_rational_parts(value))
+        .collect::<Option<Vec<_>>>()?;
+    let lcm = parts
+        .iter()
+        .fold(BigInt::one(), |acc, (_, denominator)| {
+            acc.lcm(denominator)
+        });
+    Some(
+        parts
+            .into_iter()
+            .map(|(numerator, denominator)| numerator * (&lcm / denominator))
+            .collect(),
+    )
 }
 
-fn diff_pos(a: &[usize], b: &[usize]) -> Result<usize> {
-    let mut missing = Vec::new();
-
-    for (pos, &x) in a.iter().enumerate() {
-        if !contains_sorted(b, x) {
-            missing.push(pos);
-        }
-    }
-
-    if missing.len() != 1 {
-        bail!(
-            "expected labels to differ by exactly one element, got {} missing elements from {:?} to {:?}",
-            missing.len(),
-            a,
-            b
-        );
-    }
-
-    Ok(missing[0])
+fn integer_inequality_from_hrep(h: &HRep, i: usize) -> Option<(Vec<BigInt>, BigInt)> {
+    let mut values = h.a.get(i)?.iter().map(q_to_string).collect::<Vec<_>>();
+    values.push(q_to_string(h.b.get(i)?));
+    let cleared = clear_rationals_to_integer_row(&values)?;
+    let bound = cleared.last()?.clone();
+    Some((cleared[..cleared.len() - 1].to_vec(), bound))
 }
 
-fn check_simplex_graph(h: &HRep, cert: &Certificate) -> Result<()> {
-    check_graph_labels(h, cert)?;
-
-    let m = cert.graph.lbl.len();
-
-    for (node, adj) in cert.graph.g.iter().enumerate() {
-        if adj.len() != h.d {
-            bail!(
-                "graph.g[{node}] has length {}, expected d={} (one neighbor per ridge position)",
-                adj.len(),
-                h.d
-            );
-        }
-
-        let sigma = &cert.graph.lbl[node].simplex;
-
-        for (r, &other) in adj.iter().enumerate() {
-            if other >= m {
-                bail!(
-                    "graph.g[{node}][{r}]={other} out of range 0..{}",
-                    m
-                );
-            }
-
-            if other == node {
-                bail!("graph.g[{node}][{r}] is a self-loop");
-            }
-
-            let other_sigma = &cert.graph.lbl[other].simplex;
-
-            let missing_from_node = diff_pos(sigma, other_sigma).with_context(|| {
-                format!("graph edge {node}->{other} is not a ridge adjacency")
-            })?;
-
-            if missing_from_node != r {
-                bail!(
-                    "graph.g[{node}][{r}]={other} does not correspond to deleting position {r}; \
-                     the unique element of graph.lbl[{node}] missing from graph.lbl[{other}] is at position {missing_from_node}"
-                );
-            }
-
-            let missing_from_other = diff_pos(other_sigma, sigma).with_context(|| {
-                format!("graph edge {other}->{node} is not a ridge adjacency")
-            })?;
-
-            if cert.graph.g[other].len() != h.d {
-                bail!(
-                    "graph.g[{other}] has length {}, expected d={} (one neighbor per ridge position)",
-                    cert.graph.g[other].len(),
-                    h.d
-                );
-            }
-
-            if cert.graph.g[other][missing_from_other] != node {
-                bail!(
-                    "graph adjacency is not reciprocal through the corresponding ridge: \
-                     graph.g[{node}][{r}]={other}, but graph.g[{other}][{missing_from_other}]={}",
-                    cert.graph.g[other][missing_from_other]
-                );
-            }
-        }
-    }
-
-    Ok(())
+// Rust-specific check: the Rocq checker receives the integer inequalities
+// directly and therefore has no external H-representation to compare against.
+fn check_ine_file(h: &HRep, cert: &Certificate) -> bool {
+    cert.n_inequalities == h.a.len()
+        && cert.dimension == h.d
+        && cert.inequalities.len() == h.a.len()
+        && cert.inequalities.iter().enumerate().all(|(i, inequality)| {
+            let Some(normal) = parse_bigint_vec(&inequality.a) else {
+                return false;
+            };
+            let Some(bound) = parse_bigint(&inequality.b) else {
+                return false;
+            };
+            let Some((expected_normal, expected_bound)) =
+                integer_inequality_from_hrep(h, i)
+            else {
+                return false;
+            };
+            normal == expected_normal && bound == expected_bound
+        })
 }
 
-fn sorted_difference_values(a: &[usize], b: &[usize]) -> Vec<usize> {
-    // Return a \ b, assuming both lists are strictly sorted.
-    let mut i = 0;
-    let mut j = 0;
-    let mut out = Vec::new();
+mod rocq {
+    #![allow(non_snake_case)]
 
-    while i < a.len() && j < b.len() {
-        if a[i] == b[j] {
-            i += 1;
-            j += 1;
-        } else if a[i] < b[j] {
-            out.push(a[i]);
-            i += 1;
-        } else {
-            j += 1;
-        }
+    use super::*;
+
+    pub fn areInequalitiesWellFormed(cert: &Certificate) -> bool {
+        cert.inequalities.len() == cert.n_inequalities
+            && cert.inequalities.iter().all(|inequality| {
+                let Some(normal) = parse_bigint_vec(&inequality.a) else {
+                    return false;
+                };
+                parse_bigint(&inequality.b).is_some()
+                    && normal.len() == cert.dimension
+                    && normal.iter().any(|x| !x.is_zero())
+            })
     }
 
-    out.extend_from_slice(&a[i..]);
-    out
-}
-
-fn sorted_not_subset_witness(a: &[usize], b: &[usize]) -> Option<usize> {
-    // Return x in a \ b, if one exists. Both lists are assumed strictly sorted.
-    let mut i = 0;
-    let mut j = 0;
-
-    while i < a.len() && j < b.len() {
-        if a[i] == b[j] {
-            i += 1;
-            j += 1;
-        } else if a[i] < b[j] {
-            return Some(a[i]);
-        } else {
-            j += 1;
-        }
+    pub fn arePointsWellFormed(cert: &Certificate) -> bool {
+        cert.items.iter().all(|item| {
+            let Some(numerators) = parse_bigint_vec(&item.vertex.num) else {
+                return false;
+            };
+            let Some(denominator) = parse_bigint(&item.vertex.den) else {
+                return false;
+            };
+            denominator > BigInt::zero() && numerators.len() == cert.dimension
+        })
     }
 
-    a.get(i).copied()
-}
-
-fn graph_item_neighbors(cert: &Certificate) -> Result<Vec<Vec<usize>>> {
-    let item_count = cert.items.len();
-    let mut sets = (0..item_count)
-        .map(|_| std::collections::BTreeSet::<usize>::new())
-        .collect::<Vec<_>>();
-
-    if cert.graph.g.len() != cert.graph.lbl.len() {
-        bail!(
-            "graph.g has length {}, but graph.lbl has length {}",
-            cert.graph.g.len(),
-            cert.graph.lbl.len()
-        );
+    pub fn areActiveSetsWellFormed(cert: &Certificate) -> bool {
+        cert.items.iter().all(|item| {
+            strictly_sorted(&item.incident)
+                && item
+                    .incident
+                    .iter()
+                    .all(|&i| i < cert.n_inequalities)
+        })
     }
 
-    for (node, adj) in cert.graph.g.iter().enumerate() {
-        let v = cert.graph.lbl[node].owner;
-        if v >= item_count {
-            bail!("graph.lbl[{node}].owner={v} out of range 0..{item_count}");
-        }
-
-        for &other in adj {
-            if other >= cert.graph.lbl.len() {
-                bail!(
-                    "graph.g[{node}] contains node {other}, out of range 0..{}",
-                    cert.graph.lbl.len()
-                );
-            }
-
-            let w = cert.graph.lbl[other].owner;
-            if w >= item_count {
-                bail!("graph.lbl[{other}].owner={w} out of range 0..{item_count}");
-            }
-
-            if v != w {
-                sets[v].insert(w);
-            }
-        }
+    pub fn areVerticesWellFormed(cert: &Certificate) -> bool {
+        arePointsWellFormed(cert) && areActiveSetsWellFormed(cert)
     }
 
-    Ok(sets
-        .into_iter()
-        .map(|set| set.into_iter().collect::<Vec<_>>())
-        .collect())
-}
-
-fn check_neighbor_lists(cert: &Certificate) -> Result<()> {
-    let n = cert.items.len();
-
-    if cert.neighbors.len() != n {
-        bail!(
-            "cert.neighbors has length {}, expected one list for each of the {n} items",
-            cert.neighbors.len()
-        );
+    pub fn isGraphWellFormed(cert: &Certificate) -> bool {
+        let graph = &cert.graph.g;
+        let number_of_facets = cert.graph.lbl.len();
+        graph.len() == number_of_facets
+            && graph
+                .iter()
+                .flatten()
+                .all(|&facet| facet < number_of_facets)
+            && graph
+                .iter()
+                .enumerate()
+                .all(|(i, neighbors)| !neighbors.contains(&i))
+            && is_undirected(graph)
     }
 
-    for (v, ns) in cert.neighbors.iter().enumerate() {
-        strictly_sorted_len(ns)
-            .with_context(|| format!("neighbors[{v}] is not strictly sorted"))?;
-
-        for &w in ns {
-            if w >= n {
-                bail!("neighbors[{v}] contains item {w}, out of range 0..{n}");
-            }
-            if w == v {
-                bail!("neighbors[{v}] contains a self-neighbor");
-            }
-            if !contains_sorted(&cert.neighbors[w], v) {
-                bail!(
-                    "neighbor relation is not symmetric: {w} occurs in neighbors[{v}], but {v} does not occur in neighbors[{w}]"
-                );
-            }
-        }
+    pub fn areDescriptionsWellFormed(cert: &Certificate) -> bool {
+        cert.graph.lbl.iter().all(|facet| {
+            facet.simplex.len() == cert.dimension
+                && strictly_sorted(&facet.simplex)
+                && facet
+                    .simplex
+                    .iter()
+                    .all(|&i| i < cert.n_inequalities)
+        })
     }
 
-    let expected = graph_item_neighbors(cert)
-        .context("failed to derive item-neighbor lists from simplex graph")?;
-    if cert.neighbors != expected {
-        bail!(
-            "cert.neighbors does not match cross-label adjacencies of the simplex graph: certificate={:?}, graph-derived={:?}",
-            cert.neighbors,
-            expected
-        );
-    }
-
-    Ok(())
-}
-
-fn check_geom_edge_lifts(cert: &Certificate) -> Result<()> {
-    let n = cert.items.len();
-    if cert.geom_edge_lifts.len() != n {
-        bail!(
-            "cert.geom_edge_lifts has length {}, expected one list for each of the {n} items",
-            cert.geom_edge_lifts.len()
-        );
-    }
-
-    for v in 0..n {
-        let ns = &cert.neighbors[v];
-        let lifts = &cert.geom_edge_lifts[v];
-        if lifts.len() != ns.len() {
-            bail!(
-                "geom_edge_lifts[{v}] has length {}, but neighbors[{v}] has length {}",
-                lifts.len(),
-                ns.len()
-            );
-        }
-
-        for (j, (&w, &(s, t))) in ns.iter().zip(lifts).enumerate() {
-            if s >= cert.graph.lbl.len() || t >= cert.graph.lbl.len() {
-                bail!(
-                    "geom_edge_lifts[{v}][{j}]=({s},{t}) contains a graph node out of range 0..{}",
-                    cert.graph.lbl.len()
-                );
-            }
-            if cert.graph.lbl[s].owner != v {
-                bail!(
-                    "geom_edge_lifts[{v}][{j}]=({s},{t}): owner of source simplex is {}, expected {v}",
-                    cert.graph.lbl[s].owner
-                );
-            }
-            if cert.graph.lbl[t].owner != w {
-                bail!(
-                    "geom_edge_lifts[{v}][{j}]=({s},{t}): owner of target simplex is {}, expected neighbor {w}",
-                    cert.graph.lbl[t].owner
-                );
-            }
-            if s >= cert.graph.g.len() || !cert.graph.g[s].iter().any(|&u| u == t) {
-                bail!(
-                    "geom_edge_lifts[{v}][{j}]=({s},{t}) is not an oriented edge of the simplex graph"
-                );
-            }
-        }
-    }
-
-    Ok(())
-}
-
-fn check_local_edge_test(cert: &Certificate) -> Result<()> {
-    // For fixed v, let D_w = I(v) \ I(w) for w in neighbors[v].
-    // The local edge test, for both orders of every pair of distinct
-    // neighbors, is exactly pairwise incomparability of the D_w.
-    for (v, ns) in cert.neighbors.iter().enumerate() {
-        let iv = &cert.items[v].incident;
-        let diffs = ns
+    pub fn isMappingWellFormed(cert: &Certificate) -> bool {
+        cert.graph
+            .lbl
             .iter()
-            .map(|&w| sorted_difference_values(iv, &cert.items[w].incident))
+            .all(|facet| facet.owner < cert.items.len())
+    }
+
+    pub fn areFacetsWellFormed(cert: &Certificate) -> bool {
+        areDescriptionsWellFormed(cert) && isMappingWellFormed(cert)
+    }
+
+    pub fn isGeomGraphWellFormed(cert: &Certificate) -> bool {
+        let graph = &cert.neighbors;
+        let number_of_vertices = cert.items.len();
+        graph.len() == number_of_vertices
+            && graph.iter().all(|neighbors| {
+                strictly_sorted(neighbors)
+                    && neighbors.iter().all(|&vertex| vertex < number_of_vertices)
+            })
+            && graph
+                .iter()
+                .enumerate()
+                .all(|(i, neighbors)| !neighbors.contains(&i))
+            && is_undirected(graph)
+    }
+
+    // A Rust lift stores (source facet, target facet), whereas Rocq stores
+    // (source facet, local position of the target in the source adjacency row).
+    pub fn areGeomEdgeSourcesWellFormed(cert: &Certificate) -> bool {
+        let number_of_vertices = cert.items.len();
+        let number_of_facets = cert.graph.lbl.len();
+        cert.geom_edge_lifts.len() == number_of_vertices
+            && cert
+                .geom_edge_lifts
+                .iter()
+                .enumerate()
+                .all(|(i, lifts)| {
+                    cert.neighbors.get(i).is_some_and(|neighbors| {
+                        lifts.len() == neighbors.len()
+                            && lifts.iter().all(|&(source, _)| source < number_of_facets)
+                    })
+                })
+    }
+
+    pub fn areGeomEdgeLocalTargetsWellFormed(cert: &Certificate) -> bool {
+        let number_of_vertices = cert.items.len();
+        let number_of_facets = cert.graph.lbl.len();
+        cert.geom_edge_lifts.len() == number_of_vertices
+            && cert
+                .geom_edge_lifts
+                .iter()
+                .enumerate()
+                .all(|(i, lifts)| {
+                    cert.neighbors.get(i).is_some_and(|neighbors| {
+                        lifts.len() == neighbors.len()
+                            && lifts.iter().all(|&(source, target)| {
+                                target < number_of_facets
+                                    && cert
+                                        .graph
+                                        .g
+                                        .get(source)
+                                        .is_some_and(|adjacency| adjacency.contains(&target))
+                            })
+                    })
+                })
+    }
+
+    pub fn isFullDimPointWellFormed(cert: &Certificate) -> bool {
+        let Some(point) = parse_bigint_vec(&cert.full_dim.point) else {
+            return false;
+        };
+        let Some(denominator) = parse_bigint(&cert.full_dim.denominator) else {
+            return false;
+        };
+        denominator > BigInt::zero() && point.len() == cert.dimension
+    }
+
+    pub fn isFullDimDirWellFormed(cert: &Certificate) -> bool {
+        parse_bigint_matrix(
+            &cert.full_dim.directions,
+            cert.dimension,
+            cert.dimension,
+        )
+        .is_some()
+    }
+
+    pub fn isFullDimInverseWellFormed(cert: &Certificate) -> bool {
+        parse_bigint_matrix(
+            &cert.full_dim.left_inverse,
+            cert.dimension,
+            cert.dimension,
+        )
+        .is_some()
+    }
+
+    pub fn isFullDimWellFormed(cert: &Certificate) -> bool {
+        isFullDimPointWellFormed(cert)
+            && isFullDimDirWellFormed(cert)
+            && isFullDimInverseWellFormed(cert)
+    }
+
+    pub fn isSimplexIndexWellFormed(cert: &Certificate) -> bool {
+        cert.root.simplex_id < cert.graph.lbl.len()
+    }
+
+    pub fn isActiveInverseWellFormed(cert: &Certificate) -> bool {
+        let Some(root_facet) = cert.graph.lbl.get(cert.root.simplex_id) else {
+            return false;
+        };
+        let Some(root_vertex) = cert.items.get(root_facet.owner) else {
+            return false;
+        };
+        let inverse = &cert.root.inverse_incident_map;
+        let active = &root_vertex.incident;
+        let sentinel = cert.n_inequalities;
+
+        inverse.len() == cert.n_inequalities
+            && active
+                .iter()
+                .enumerate()
+                .all(|(i, &row)| inverse.get(row) == Some(&i))
+            && inverse.iter().enumerate().all(|(row, &value)| {
+                active.binary_search(&row).is_ok() || value == sentinel
+            })
+    }
+
+    pub fn areWitnessesWellFormed(cert: &Certificate) -> bool {
+        parse_bigint_matrix(
+            &cert.root.basis_vectors,
+            cert.dimension,
+            cert.dimension,
+        )
+        .is_some()
+    }
+
+    pub fn areScalarProductsWellFormed(cert: &Certificate) -> bool {
+        let Some(root_facet) = cert.graph.lbl.get(cert.root.simplex_id) else {
+            return false;
+        };
+        let Some(root_vertex) = cert.items.get(root_facet.owner) else {
+            return false;
+        };
+        parse_bigint_matrix(
+            &cert.root.m_matrix,
+            root_vertex.incident.len(),
+            cert.dimension,
+        )
+        .is_some()
+    }
+
+    pub fn isSparseVectorWellFormed(dimension: usize, weight: &[(usize, String)]) -> bool {
+        weight.iter().all(|(i, value)| {
+            *i < dimension && parse_bigint(value).is_some_and(|x| !x.is_zero())
+        }) && weight.windows(2).all(|w| w[0].0 < w[1].0)
+    }
+
+    pub fn areWeightsWellFormed(cert: &Certificate) -> bool {
+        let Some(root_facet) = cert.graph.lbl.get(cert.root.simplex_id) else {
+            return false;
+        };
+        let expected = cert
+            .graph
+            .lbl
+            .iter()
+            .enumerate()
+            .filter(|(i, facet)| {
+                *i != cert.root.simplex_id && facet.owner == root_facet.owner
+            })
+            .count();
+        cert.root.q_vectors.len() == expected
+            && cert
+                .root
+                .q_vectors
+                .iter()
+                .all(|weight| isSparseVectorWellFormed(cert.dimension, weight))
+    }
+
+    pub fn isRootWellFormed(cert: &Certificate) -> bool {
+        isSimplexIndexWellFormed(cert)
+            && isActiveInverseWellFormed(cert)
+            && areWitnessesWellFormed(cert)
+            && areScalarProductsWellFormed(cert)
+            && areWeightsWellFormed(cert)
+    }
+
+    pub fn areActiveSetsUnique(cert: &Certificate) -> bool {
+        let active_sets = cert
+            .items
+            .iter()
+            .map(|item| item.incident.clone())
+            .collect::<Vec<_>>();
+        strictly_lexicographically_sorted(&active_sets)
+    }
+
+    pub fn areFacetsUnique(cert: &Certificate) -> bool {
+        let descriptions = cert
+            .graph
+            .lbl
+            .iter()
+            .map(|facet| facet.simplex.clone())
+            .collect::<Vec<_>>();
+        strictly_lexicographically_sorted(&descriptions)
+    }
+
+    pub fn check_ineqs(
+        inequalities: &[ParsedInequality],
+        active_set: &[usize],
+        numerators: &[BigInt],
+        denominator: &BigInt,
+    ) -> bool {
+        let mut active_position = 0;
+
+        for (i, (normal, bound)) in inequalities.iter().enumerate() {
+            let Some(lhs) = dot(normal, numerators) else {
+                return false;
+            };
+            let rhs = bound * denominator;
+
+            if active_set.get(active_position) == Some(&i) {
+                if lhs != rhs {
+                    return false;
+                }
+                active_position += 1;
+            } else if lhs >= rhs {
+                return false;
+            }
+        }
+
+        active_position == active_set.len()
+    }
+
+    pub fn feasibility_check(cert: &Certificate) -> bool {
+        let Some(inequalities) = parse_inequalities(cert) else {
+            return false;
+        };
+
+        cert.items.iter().all(|item| {
+            let Some(numerators) = parse_bigint_vec(&item.vertex.num) else {
+                return false;
+            };
+            let Some(denominator) = parse_bigint(&item.vertex.den) else {
+                return false;
+            };
+
+            check_ineqs(
+                &inequalities,
+                &item.incident,
+                &numerators,
+                &denominator,
+            )
+        })
+    }
+
+    pub fn isRidgeInFacet(facet1: &[usize], facet2: &[usize], value: usize) -> bool {
+        let difference = sorted_difference(facet1, facet2);
+        difference.len() == 1 && difference[0] == value
+    }
+
+    pub fn graph_check(cert: &Certificate) -> bool {
+        cert.graph.g.iter().enumerate().all(|(i, neighbors)| {
+            neighbors.len() <= cert.dimension
+                && neighbors.iter().enumerate().all(|(j, &neighbor)| {
+                    let Some(facet) = cert.graph.lbl.get(i) else {
+                        return false;
+                    };
+                    let Some(other_facet) = cert.graph.lbl.get(neighbor) else {
+                        return false;
+                    };
+                    facet.simplex.get(j).is_some_and(|&value| {
+                        isRidgeInFacet(&facet.simplex, &other_facet.simplex, value)
+                    })
+                })
+        })
+    }
+
+    pub fn mapping_check(cert: &Certificate) -> bool {
+        cert.graph.lbl.iter().all(|facet| {
+            cert.items
+                .get(facet.owner)
+                .is_some_and(|vertex| sorted_subset(&facet.simplex, &vertex.incident))
+        })
+    }
+
+    pub fn scalarProducts_check(cert: &Certificate) -> bool {
+        let Some(root_facet) = cert.graph.lbl.get(cert.root.simplex_id) else {
+            return false;
+        };
+        let Some(root_vertex) = cert.items.get(root_facet.owner) else {
+            return false;
+        };
+        let Some(witnesses) = parse_bigint_matrix(
+            &cert.root.basis_vectors,
+            cert.dimension,
+            cert.dimension,
+        ) else {
+            return false;
+        };
+        let Some(products) = parse_bigint_matrix(
+            &cert.root.m_matrix,
+            root_vertex.incident.len(),
+            cert.dimension,
+        ) else {
+            return false;
+        };
+
+        root_vertex
+            .incident
+            .iter()
+            .enumerate()
+            .all(|(i, &row)| {
+                let Some(inequality) = cert.inequalities.get(row) else {
+                    return false;
+                };
+                let Some(normal) = parse_bigint_vec(&inequality.a) else {
+                    return false;
+                };
+                (0..cert.dimension).all(|j| {
+                    dot(&normal, &witnesses[j])
+                        .is_some_and(|expected| products[i][j] == expected)
+                })
+            })
+    }
+
+    pub fn inversibility_check(cert: &Certificate) -> bool {
+        let Some(root_facet) = cert.graph.lbl.get(cert.root.simplex_id) else {
+            return false;
+        };
+        let Some(root_vertex) = cert.items.get(root_facet.owner) else {
+            return false;
+        };
+        let Some(products) = parse_bigint_matrix(
+            &cert.root.m_matrix,
+            root_vertex.incident.len(),
+            cert.dimension,
+        ) else {
+            return false;
+        };
+
+        root_facet
+            .simplex
+            .iter()
+            .enumerate()
+            .all(|(i, &row)| {
+                let Some(&active_position) = cert.root.inverse_incident_map.get(row) else {
+                    return false;
+                };
+                let Some(product_row) = products.get(active_position) else {
+                    return false;
+                };
+                (0..cert.dimension).all(|j| {
+                    if i == j {
+                        product_row[j] > BigInt::zero()
+                    } else {
+                        product_row[j].is_zero()
+                    }
+                })
+            })
+    }
+
+    pub fn isSparseVectorPositive(weight: &[(usize, String)]) -> bool {
+        !weight.is_empty()
+            && weight.iter().all(|(_, value)| {
+                parse_bigint(value).is_some_and(|x| x >= BigInt::zero())
+            })
+    }
+
+    pub fn separability_check(cert: &Certificate) -> bool {
+        let Some(root_facet) = cert.graph.lbl.get(cert.root.simplex_id) else {
+            return false;
+        };
+        let Some(root_vertex) = cert.items.get(root_facet.owner) else {
+            return false;
+        };
+        let Some(products) = parse_bigint_matrix(
+            &cert.root.m_matrix,
+            root_vertex.incident.len(),
+            cert.dimension,
+        ) else {
+            return false;
+        };
+
+        let same_owner_nonroot = cert
+            .graph
+            .lbl
+            .iter()
+            .enumerate()
+            .filter(|(i, facet)| {
+                *i != cert.root.simplex_id && facet.owner == root_facet.owner
+            })
+            .map(|(_, facet)| facet)
             .collect::<Vec<_>>();
 
-        for j in 0..diffs.len() {
-            for k in (j + 1)..diffs.len() {
-                if sorted_not_subset_witness(&diffs[j], &diffs[k]).is_none() {
-                    bail!(
-                        "local edge test failed at item {v}: D_{{{}}}=I({v})\\I({}) is contained in D_{{{}}}=I({v})\\I({}); D_{{{}}}={:?}, D_{{{}}}={:?}",
-                        ns[j],
-                        ns[j],
-                        ns[k],
-                        ns[k],
-                        ns[j],
-                        diffs[j],
-                        ns[k],
-                        diffs[k]
-                    );
-                }
-                if sorted_not_subset_witness(&diffs[k], &diffs[j]).is_none() {
-                    bail!(
-                        "local edge test failed at item {v}: D_{{{}}}=I({v})\\I({}) is contained in D_{{{}}}=I({v})\\I({}); D_{{{}}}={:?}, D_{{{}}}={:?}",
-                        ns[k],
-                        ns[k],
-                        ns[j],
-                        ns[j],
-                        ns[k],
-                        diffs[k],
-                        ns[j],
-                        diffs[j]
-                    );
-                }
-            }
-        }
+        cert.root.q_vectors.len() == same_owner_nonroot.len()
+            && same_owner_nonroot
+                .iter()
+                .zip(&cert.root.q_vectors)
+                .all(|(facet, weight)| {
+                    isSparseVectorPositive(weight)
+                        && facet.simplex.iter().all(|&row| {
+                            let Some(&active_position) =
+                                cert.root.inverse_incident_map.get(row)
+                            else {
+                                return false;
+                            };
+                            products.get(active_position).is_some_and(|product_row| {
+                                sparse_dot(weight, product_row)
+                                    .is_some_and(|value| value <= BigInt::zero())
+                            })
+                        })
+                })
     }
 
-    Ok(())
-}
+    pub fn graph_image_check(cert: &Certificate) -> bool {
+        let graph_edges_are_mapped =
+            cert.graph.g.iter().enumerate().all(|(source_facet, neighbors)| {
+                neighbors.iter().all(|&target_facet| {
+                    let Some(source) = cert.graph.lbl.get(source_facet) else {
+                        return false;
+                    };
+                    let Some(target) = cert.graph.lbl.get(target_facet) else {
+                        return false;
+                    };
+                    source.owner == target.owner
+                        || cert
+                            .neighbors
+                            .get(source.owner)
+                            .is_some_and(|neighbors| {
+                                neighbors.binary_search(&target.owner).is_ok()
+                            })
+                })
+            });
 
+        let geom_edges_are_images =
+            cert.neighbors.iter().enumerate().all(|(source_vertex, neighbors)| {
+                let Some(lifts) = cert.geom_edge_lifts.get(source_vertex) else {
+                    return false;
+                };
+                lifts.len() == neighbors.len()
+                    && neighbors.iter().zip(lifts).all(
+                        |(&target_vertex, &(source_facet, target_facet))| {
+                            cert.graph
+                                .lbl
+                                .get(source_facet)
+                                .zip(cert.graph.lbl.get(target_facet))
+                                .is_some_and(|(source, target)| {
+                                    source.owner == source_vertex
+                                        && target.owner == target_vertex
+                                        && cert
+                                            .graph
+                                            .g
+                                            .get(source_facet)
+                                            .is_some_and(|adjacency| {
+                                                adjacency.contains(&target_facet)
+                                            })
+                                })
+                        },
+                    )
+            });
 
-fn parse_bigint_vec(xs: &[String], what: &str) -> Result<Vec<BigInt>> {
-    xs.iter()
-        .enumerate()
-        .map(|(i, s)| parse_bigint_decimal(s, &format!("{what}[{i}]")))
-        .collect()
-}
-
-fn parse_bigint_matrix(m: &[Vec<String>], rows: usize, cols: usize, what: &str) -> Result<Vec<Vec<BigInt>>> {
-    if m.len() != rows {
-        bail!("{what} has {} rows, expected {rows}", m.len());
+        graph_edges_are_mapped && geom_edges_are_images
     }
 
-    m.iter()
-        .enumerate()
-        .map(|(i, row)| {
-            if row.len() != cols {
-                bail!("{what}[{i}] has {} columns, expected {cols}", row.len());
-            }
-            parse_bigint_vec(row, &format!("{what}[{i}]"))
+    fn not_subset(xs: &[usize], ys: &[usize]) -> bool {
+        !sorted_subset(xs, ys)
+    }
+
+    fn incomparable(xs: &[usize], ys: &[usize]) -> bool {
+        not_subset(xs, ys) && not_subset(ys, xs)
+    }
+
+    pub fn geom_edge_pairwise_check(cert: &Certificate) -> bool {
+        cert.items.iter().enumerate().all(|(i, vertex)| {
+            let Some(neighbors) = cert.neighbors.get(i) else {
+                return false;
+            };
+            let Some(differences) = neighbors
+                .iter()
+                .map(|&neighbor| {
+                    cert.items.get(neighbor).map(|other_vertex| {
+                        sorted_difference(&vertex.incident, &other_vertex.incident)
+                    })
+                })
+                .collect::<Option<Vec<_>>>()
+            else {
+                return false;
+            };
+
+            differences.iter().all(|difference| !difference.is_empty())
+                && (0..differences.len()).all(|j| {
+                    ((j + 1)..differences.len())
+                        .all(|k| incomparable(&differences[j], &differences[k]))
+                })
         })
-        .collect()
-}
+    }
 
-fn dot_bigint(a: &[BigInt], x: &[BigInt]) -> BigInt {
-    a.iter()
-        .zip(x)
-        .fold(BigInt::zero(), |acc, (ai, xi)| acc + ai * xi)
-}
+    pub fn connectivity_check(cert: &Certificate) -> bool {
+        let graph = &cert.neighbors;
+        if graph.is_empty() {
+            return true;
+        }
 
-fn parse_certificate_integer_rows(cert: &Certificate, d: usize) -> Result<Vec<Vec<BigInt>>> {
-    cert.inequalities
-        .iter()
-        .enumerate()
-        .map(|(i, ineq)| {
-            if ineq.a.len() != d {
-                bail!(
-                    "certificate inequality {i} has {} coefficients, expected d={d}",
-                    ineq.a.len()
-                );
+        let mut visited = vec![false; graph.len()];
+        let mut queue = VecDeque::new();
+        visited[0] = true;
+        queue.push_back(0usize);
+        let mut count = 1usize;
+
+        while let Some(vertex) = queue.pop_front() {
+            let Some(neighbors) = graph.get(vertex) else {
+                return false;
+            };
+            for &neighbor in neighbors {
+                if neighbor >= graph.len() {
+                    return false;
+                }
+                if !visited[neighbor] {
+                    visited[neighbor] = true;
+                    count += 1;
+                    queue.push_back(neighbor);
+                }
             }
-            parse_bigint_vec(&ineq.a, &format!("inequality {i}.a"))
+        }
+
+        count == graph.len()
+    }
+
+    pub fn full_dim_feasibility_check(cert: &Certificate) -> bool {
+        let Some(point) = parse_bigint_vec(&cert.full_dim.point) else {
+            return false;
+        };
+        let Some(denominator) = parse_bigint(&cert.full_dim.denominator) else {
+            return false;
+        };
+        let Some(directions) = parse_bigint_matrix(
+            &cert.full_dim.directions,
+            cert.dimension,
+            cert.dimension,
+        ) else {
+            return false;
+        };
+
+        cert.inequalities.iter().all(|inequality| {
+            let Some(normal) = parse_bigint_vec(&inequality.a) else {
+                return false;
+            };
+            let Some(bound) = parse_bigint(&inequality.b) else {
+                return false;
+            };
+            let Some(base) = dot(&normal, &point) else {
+                return false;
+            };
+            let rhs = bound * &denominator;
+            base <= rhs
+                && directions.iter().all(|direction| {
+                    dot(&normal, direction)
+                        .is_some_and(|increment| &base + increment <= rhs)
+                })
         })
-        .collect()
+    }
+
+    pub fn full_dim_inverse_check(cert: &Certificate) -> bool {
+        let Some(directions) = parse_bigint_matrix(
+            &cert.full_dim.directions,
+            cert.dimension,
+            cert.dimension,
+        ) else {
+            return false;
+        };
+        let Some(inverse) = parse_bigint_matrix(
+            &cert.full_dim.left_inverse,
+            cert.dimension,
+            cert.dimension,
+        ) else {
+            return false;
+        };
+
+        (0..cert.dimension).all(|i| {
+            (0..cert.dimension).all(|j| {
+                dot(&directions[i], &inverse[j]).is_some_and(|value| {
+                    if i == j {
+                        !value.is_zero()
+                    } else {
+                        value.is_zero()
+                    }
+                })
+            })
+        })
+    }
+
+    pub fn full_dim_check(cert: &Certificate) -> bool {
+        full_dim_feasibility_check(cert) && full_dim_inverse_check(cert)
+    }
+
+    pub fn well_formedness_check(cert: &Certificate) -> bool {
+        areInequalitiesWellFormed(cert)
+            && areVerticesWellFormed(cert)
+            && isGraphWellFormed(cert)
+            && areFacetsWellFormed(cert)
+            && isGeomGraphWellFormed(cert)
+            && areGeomEdgeSourcesWellFormed(cert)
+            && areGeomEdgeLocalTargetsWellFormed(cert)
+            && isFullDimWellFormed(cert)
+            && isRootWellFormed(cert)
+    }
+
+    pub fn uniqueness_check(cert: &Certificate) -> bool {
+        areActiveSetsUnique(cert) && areFacetsUnique(cert)
+    }
+
+    pub fn root_check(cert: &Certificate) -> bool {
+        scalarProducts_check(cert)
+            && inversibility_check(cert)
+            && separability_check(cert)
+    }
+
+    pub fn geom_graph_check(cert: &Certificate) -> bool {
+        graph_image_check(cert)
+            && geom_edge_pairwise_check(cert)
+            && connectivity_check(cert)
+    }
+
+    // This follows the literal Rocq definition. As in the Rocq benchmark,
+    // full_dim_check is evaluated separately by the file-level entry point.
+    pub fn check_certificate(cert: &Certificate) -> bool {
+        well_formedness_check(cert)
+            && uniqueness_check(cert)
+            && feasibility_check(cert)
+            && graph_check(cert)
+            && mapping_check(cert)
+            && root_check(cert)
+            && geom_graph_check(cert)
+    }
 }
 
-
-fn check_full_dim(cert: &Certificate) -> Result<()> {
-    let d = cert.dimension;
-    let fd = &cert.full_dim;
-
-    let q = parse_bigint_decimal(&fd.denominator, "full_dim.denominator")?;
-    if q <= BigInt::zero() {
-        bail!("full_dim.denominator must be positive, got {q}");
-    }
-
-    let p = parse_bigint_vec(&fd.point, "full_dim.point")?;
-    if p.len() != d {
-        bail!(
-            "full_dim.point has length {}, expected dimension {d}",
-            p.len()
-        );
-    }
-    let r = parse_bigint_matrix(&fd.directions, d, d, "full_dim.directions")?;
-    let u = parse_bigint_matrix(&fd.left_inverse, d, d, "full_dim.left_inverse")?;
-
-    for (ineq_id, ineq) in cert.inequalities.iter().enumerate() {
-        let a = parse_bigint_vec(&ineq.a, &format!("inequality {ineq_id}.a"))?;
-        if a.len() != d {
-            bail!(
-                "inequality {ineq_id} has {} coefficients, expected dimension {d}",
-                a.len()
-            );
-        }
-        let b = parse_bigint_decimal(&ineq.b, &format!("inequality {ineq_id}.b"))?;
-        let rhs = &q * b;
-        let base = dot_bigint(&a, &p);
-        if base > rhs {
-            bail!(
-                "full-dimensionality base point violates inequality {ineq_id}: {base} > {rhs}"
-            );
-        }
-
-        for j in 0..d {
-            let direction_dot = dot_bigint(&a, &r[j]);
-            let value = &base + direction_dot;
-            if value > rhs {
-                bail!(
-                    "full-dimensionality point x0+y^{j} violates inequality {ineq_id}: {value} > {rhs}"
-                );
-            }
-        }
-    }
-
-    for i in 0..d {
-        for j in 0..d {
-            let product = dot_bigint(&u[i], &r[j]);
-            if i == j {
-                if product.is_zero() {
-                    bail!(
-                        "full_dim.left_inverse * full_dim.directions has zero diagonal entry at ({i},{j})"
-                    );
-                }
-            } else if !product.is_zero() {
-                bail!(
-                    "full_dim.left_inverse * full_dim.directions is not diagonal: entry ({i},{j}) is {product}"
-                );
-            }
-        }
-    }
-
-    Ok(())
-}
-
-fn check_root(h: &HRep, cert: &Certificate) -> Result<()> {
-    let root = &cert.root;
-
-    if root.simplex_id >= cert.graph.lbl.len() {
-        bail!(
-            "root.simplex_id={} out of range 0..{}",
-            root.simplex_id,
-            cert.graph.lbl.len()
-        );
-    }
-
-    let root_label = &cert.graph.lbl[root.simplex_id];
-    let k0 = root_label.owner;
-    let item = cert
-        .items
-        .get(k0)
-        .ok_or_else(|| anyhow!("root owner k0={k0} out of range 0..{}", cert.items.len()))?;
-
-    if root_label.simplex.len() != h.d {
-        bail!(
-            "root simplex graph node {} has length {}, expected d={}",
-            root.simplex_id,
-            root_label.simplex.len(),
-            h.d
-        );
-    }
-
-    if !sorted_subset(&root_label.simplex, &item.incident) {
-        bail!(
-            "root simplex {:?} is not contained in I(root owner {})={:?}",
-            root_label.simplex,
-            k0,
-            item.incident
-        );
-    }
-
-    if root.inverse_incident_map.len() != cert.n_inequalities {
-        bail!(
-            "root.inverse_incident_map has length {}, expected n={}",
-            root.inverse_incident_map.len(),
-            cert.n_inequalities
-        );
-    }
-
-    let sentinel = cert.n_inequalities;
-    for (global_row, &local_pos) in root.inverse_incident_map.iter().enumerate() {
-        if local_pos == sentinel {
-            if item.incident.binary_search(&global_row).is_ok() {
-                bail!(
-                    "root.inverse_incident_map[{global_row}] is the sentinel {sentinel}, but row {global_row} belongs to I(root owner {k0})"
-                );
-            }
-        } else {
-            if local_pos >= item.incident.len() {
-                bail!(
-                    "root.inverse_incident_map[{global_row}]={local_pos}, expected a local position below {} or sentinel {sentinel}",
-                    item.incident.len()
-                );
-            }
-            if item.incident[local_pos] != global_row {
-                bail!(
-                    "root.inverse_incident_map[{global_row}]={local_pos}, but I(root owner {k0})[{local_pos}]={}",
-                    item.incident[local_pos]
-                );
-            }
-        }
-    }
-    for (local_pos, &global_row) in item.incident.iter().enumerate() {
-        if root.inverse_incident_map[global_row] != local_pos {
-            bail!(
-                "root inverse map mismatch: I(root owner {k0})[{local_pos}]={global_row}, but inverse_incident_map[{global_row}]={}",
-                root.inverse_incident_map[global_row]
-            );
-        }
-    }
-
-    let basis = parse_bigint_matrix(&root.basis_vectors, h.d, h.d, "root.basis_vectors")?;
-    let m_matrix = parse_bigint_matrix(
-        &root.m_matrix,
-        item.incident.len(),
-        h.d,
-        "root.m_matrix",
-    )?;
-    let a_int = parse_certificate_integer_rows(cert, h.d)?;
-
-    for (p, &row_id) in item.incident.iter().enumerate() {
-        let a = a_int.get(row_id).ok_or_else(|| {
-            anyhow!(
-                "item {k0}: incident row {row_id} out of range 0..{}",
-                a_int.len()
-            )
-        })?;
-
-        for j in 0..h.d {
-            let expected = dot_bigint(a, &basis[j]);
-            if m_matrix[p][j] != expected {
-                bail!(
-                    "root M mismatch at active row position {p} (global row {row_id}), column {j}: got {}, expected {}",
-                    m_matrix[p][j],
-                    expected
-                );
-            }
-        }
-    }
-
-    for (root_pos, &row_id) in root_label.simplex.iter().enumerate() {
-        let local_pos = root.inverse_incident_map[row_id];
-        if local_pos == sentinel {
-            bail!(
-                "root row {row_id} is not contained in I(root owner {})={:?}",
-                k0,
-                item.incident
-            );
-        }
-
-        for j in 0..h.d {
-            let val = &m_matrix[local_pos][j];
-            if j == root_pos {
-                if val <= &BigInt::zero() {
-                    bail!(
-                        "root diagonal condition failed for row {row_id}, column {j}: expected > 0, got {val}"
-                    );
-                }
-            } else if !val.is_zero() {
-                bail!(
-                    "root off-diagonal condition failed for row {row_id}, column {j}: expected 0, got {val}"
-                );
-            }
-        }
-    }
-
-    let same_owner_nonroot = cert
-        .graph
-        .lbl
-        .iter()
-        .enumerate()
-        .filter(|(label_id, label)| label.owner == k0 && *label_id != root.simplex_id)
-        .collect::<Vec<_>>();
-
-    if root.q_vectors.len() != same_owner_nonroot.len() {
-        bail!(
-            "root.q_vectors has length {}, expected {} same-owner non-root simplices",
-            root.q_vectors.len(),
-            same_owner_nonroot.len()
-        );
-    }
-
-    for (q_idx, ((label_id, label), sparse)) in same_owner_nonroot
-        .iter()
-        .zip(root.q_vectors.iter())
-        .enumerate()
-    {
-        let mut last_index = None::<usize>;
-        let mut nonzero = false;
-        let mut parsed = Vec::<(usize, BigInt)>::with_capacity(sparse.len());
-
-        for (entry_pos, (coord, value_s)) in sparse.iter().enumerate() {
-            if *coord >= h.d {
-                bail!(
-                    "root.q_vectors[{q_idx}][{entry_pos}] has coordinate {}, expected in 0..{}",
-                    coord,
-                    h.d
-                );
-            }
-            if let Some(prev) = last_index {
-                if prev >= *coord {
-                    bail!(
-                        "root.q_vectors[{q_idx}] is not strictly sorted by coordinate: {prev} then {coord}"
-                    );
-                }
-            }
-            last_index = Some(*coord);
-
-            let value = parse_bigint_decimal(value_s, &format!("root.q_vectors[{q_idx}][{entry_pos}].value"))?;
-            if value < BigInt::zero() {
-                bail!(
-                    "root.q_vectors[{q_idx}][{entry_pos}] has negative value {value}"
-                );
-            }
-            if !value.is_zero() {
-                nonzero = true;
-            }
-            parsed.push((*coord, value));
-        }
-
-        if !nonzero {
-            bail!("root.q_vectors[{q_idx}] for graph node {label_id} is zero");
-        }
-
-        for &row_id in &label.simplex {
-            if row_id >= root.inverse_incident_map.len() {
-                bail!(
-                    "same-owner simplex graph node {label_id} contains row {row_id} out of range 0..{}",
-                    root.inverse_incident_map.len()
-                );
-            }
-            let local_pos = root.inverse_incident_map[row_id];
-            if local_pos == sentinel {
-                bail!(
-                    "same-owner simplex graph node {label_id} contains row {row_id}, not in I(root owner {})={:?}",
-                    k0,
-                    item.incident
-                );
-            }
-
-            let mut sum = BigInt::zero();
-            for (coord, value) in &parsed {
-                sum += value * &m_matrix[local_pos][*coord];
-            }
-
-            if sum > BigInt::zero() {
-                bail!(
-                    "root.q_vectors[{q_idx}] fails on same-owner graph node {label_id}, row {row_id}: dot = {sum} > 0"
-                );
-            }
-        }
-    }
-
-    Ok(())
-}
-
-
-fn time_check<T, F>(name: &str, f: F) -> Result<T>
-where
-    F: FnOnce() -> Result<T>,
-{
-    let t0 = Instant::now();
-    let res = f();
-    let dt = t0.elapsed();
-    eprintln!("{name}: {:.6} s", dt.as_secs_f64());
-    res
+fn timed_bool(name: &str, check: impl FnOnce() -> bool) -> bool {
+    let start = Instant::now();
+    let result = check();
+    eprintln!("{name}: {:.6} s", start.elapsed().as_secs_f64());
+    result
 }
 
 pub fn check_certificate(ine_path: &str, certificate_path: &str) -> Result<()> {
-    let h = time_check("parse H-representation", || {
-        parse_lrs_hrep(ine_path).context("failed to parse H-representation")
-    })?;
+    let start = Instant::now();
+    let h = parse_lrs_hrep(ine_path).context("failed to parse H-representation")?;
+    eprintln!(
+        "Parse H-representation: {:.6} s",
+        start.elapsed().as_secs_f64()
+    );
 
-    let cert = time_check("read certificate", || read_certificate(certificate_path))?;
+    let start = Instant::now();
+    let cert = read_certificate(certificate_path)?;
+    eprintln!("Read certificate: {:.6} s", start.elapsed().as_secs_f64());
 
-    time_check("explicit size check", || check_explicit_sizes(&h, &cert))?;
+    let inequality_file_check =
+        timed_bool("Inequality file check", || check_ine_file(&h, &cert));
+    let well_formedness =
+        timed_bool("Well-formedness check", || rocq::well_formedness_check(&cert));
+    let uniqueness = timed_bool("Uniqueness check", || rocq::uniqueness_check(&cert));
+    let feasibility = timed_bool("Feasibility check", || rocq::feasibility_check(&cert));
+    let graph = timed_bool("Graph check", || rocq::graph_check(&cert));
+    let mapping = timed_bool("Mapping check", || rocq::mapping_check(&cert));
+    let root = timed_bool("Root check", || rocq::root_check(&cert));
+    let geometric_graph =
+        timed_bool("Geometric graph check", || rocq::geom_graph_check(&cert));
+    let full_dimension =
+        timed_bool("Full dimension check", || rocq::full_dim_check(&cert));
 
-    time_check("certificate inequality check", || {
-        check_certificate_inequalities(&h, &cert).context("certificate inequality check failed")
-    })?;
+    let accepted = inequality_file_check
+        && well_formedness
+        && uniqueness
+        && feasibility
+        && graph
+        && mapping
+        && root
+        && geometric_graph
+        && full_dimension;
 
-    time_check("basic item consistency check", || {
-        check_items_basic(&h, &cert).context("basic item consistency check failed")
-    })?;
-
-    time_check("simplex graph check", || {
-        check_simplex_graph(&h, &cert).context("simplex graph check failed")
-    })?;
-
-    time_check("full-dimensionality check", || {
-        check_full_dim(&cert).context("full-dimensionality check failed")
-    })?;
-
-    time_check("root check", || {
-        check_root(&h, &cert).context("root check failed")
-    })?;
-
-    time_check("neighbor-list check", || {
-        check_neighbor_lists(&cert).context("neighbor-list check failed")
-    })?;
-
-    time_check("geometric-edge lift check", || {
-        check_geom_edge_lifts(&cert).context("geometric-edge lift check failed")
-    })?;
-
-    time_check("local edge test", || {
-        check_local_edge_test(&cert).context("local edge test failed")
-    })?;
-
-    Ok(())
+    accepted
+        .then_some(())
+        .ok_or_else(|| anyhow!("certificate rejected"))
 }
