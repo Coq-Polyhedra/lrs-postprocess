@@ -2,9 +2,7 @@ use anyhow::{bail, Context, Result};
 use num_bigint::{BigInt, BigUint, Sign};
 use num_integer::Integer;
 use num_traits::{One, Signed, ToPrimitive, Zero};
-use std::fs::File;
-use std::io::{BufWriter, Write};
-use std::path::Path;
+use std::io::Write;
 
 use crate::certificate::{read_certificate, Certificate, FullDimCertificate, GraphLabel, Inequality, Root, SimplexGraph, VertexCoords, VertexItem};
 
@@ -498,7 +496,7 @@ fn write_certificate_value<W: Write>(w: &mut W, cert: &Certificate) -> Result<()
     Ok(())
 }
 
-pub fn write_certificate_bin<W: std::io::Write>(
+pub fn write_certificate_bin<W: Write>(
     w: &mut W,
     cert: &crate::certificate::Certificate,
 ) -> anyhow::Result<()> {

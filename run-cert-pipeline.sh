@@ -33,6 +33,16 @@ format_elapsed_seconds() {
     fi
 }
 
+format_elapsed_precise() {
+    local seconds="$1"
+
+    if [[ -z "$seconds" ]]; then
+        printf "unknown"
+    else
+        awk -v t="$seconds" 'BEGIN { printf "%.6f s", t }'
+    fi
+}
+
 format_ratio() {
     local elapsed="$1"
     local reference="$2"
@@ -46,6 +56,22 @@ format_ratio() {
         if (r <= 0) printf "unknown";
         else printf "%.3fx lrs", t / r;
     }'
+}
+
+format_timing_with_lrs() {
+    local elapsed="$1"
+    local reference="$2"
+
+    if [[ -z "$elapsed" ]]; then
+        printf "unknown"
+    elif [[ -z "$reference" ]]; then
+        format_elapsed_precise "$elapsed"
+    else
+        awk -v t="$elapsed" -v r="$reference" 'BEGIN {
+            if (r <= 0) printf "%.6f s", t;
+            else printf "%.6f s (%.6fx lrs)", t, t / r;
+        }'
+    fi
 }
 
 read_lrs_elapsed() {
@@ -173,6 +199,36 @@ run_timed_stdout_to_file() {
     return "$status"
 }
 
+# Run a command whose stdout is the generated artifact and whose stderr is the
+# detailed timing log. The command itself reports the disjoint internal phases,
+# so deliberately do not add another grouped wall-clock timing here.
+run_stdout_to_file() {
+    local name="$1"
+    local out_file="$2"
+    local log_file="$3"
+    shift 3
+
+    echo
+    echo "=== $name ==="
+
+    local status
+    if "$@" > "$out_file" 2> "$log_file"; then
+        status=0
+    else
+        status=$?
+    fi
+
+    if [[ "$status" -eq 0 ]]; then
+        echo "--- $name completed ---"
+    else
+        echo "--- $name failed ---"
+    fi
+    echo "output: $out_file"
+    echo "log: $log_file"
+
+    return "$status"
+}
+
 build_tools() {
     echo
     echo "=== build Rust tools ==="
@@ -268,10 +324,84 @@ generate_binary_certificate() {
         echo "warning: missing lrs time for $base; run '$0 ext $base' first for ratios" >&2
     fi
 
-    run_timed_stdout_to_file "generate binary certificate for $base" "$bin_file" "$log_file" "$lrs_elapsed" \
+    run_stdout_to_file "create, check, and encode certificate for $base" "$bin_file" "$log_file" \
         $BIN_CERT_GEN \
         "$ine_file" \
         "$ext_file"
+
+    report_binary_phases "$base"
+}
+
+report_binary_phases() {
+    local base="$1"
+    local log_file="${DATA_DIR}/${base}-bin.log"
+    local lrs_elapsed
+    lrs_elapsed="$(read_lrs_elapsed "$base")"
+
+    local read_ine_time read_ext_time build_items_time build_graph_time
+    local choose_root_time build_root_time inequalities_time geom_graph_time
+    local full_dim_time assemble_time create_time
+    local prepare_time inequality_check_time well_formedness_time uniqueness_time
+    local feasibility_time graph_check_time mapping_time root_check_time
+    local geom_check_time full_dim_check_time check_time binary_time
+
+    read_ine_time="$(read_internal_seconds "$log_file" "Certificate: read and parse .ine file")"
+    read_ext_time="$(read_internal_seconds "$log_file" "Certificate: read and parse .ext file")"
+    build_items_time="$(read_internal_seconds "$log_file" "Certificate: build vertices and facets")"
+    build_graph_time="$(read_internal_seconds "$log_file" "Certificate: build facet graph")"
+    choose_root_time="$(read_internal_seconds "$log_file" "Certificate: choose root vertex")"
+    build_root_time="$(read_internal_seconds "$log_file" "Certificate: build root certificate")"
+    inequalities_time="$(read_internal_seconds "$log_file" "Certificate: convert inequalities")"
+    geom_graph_time="$(read_internal_seconds "$log_file" "Certificate: build geometric graph and lifts")"
+    full_dim_time="$(read_internal_seconds "$log_file" "Certificate: build full-dimensionality certificate")"
+    assemble_time="$(read_internal_seconds "$log_file" "Certificate: assemble value")"
+    create_time="$(read_internal_seconds "$log_file" "Create certificate in memory")"
+
+    prepare_time="$(read_internal_seconds "$log_file" "Prepare in-memory checker input")"
+    inequality_check_time="$(read_internal_seconds "$log_file" "Inequality file check")"
+    well_formedness_time="$(read_internal_seconds "$log_file" "Well-formedness check")"
+    uniqueness_time="$(read_internal_seconds "$log_file" "Uniqueness check")"
+    feasibility_time="$(read_internal_seconds "$log_file" "Feasibility check")"
+    graph_check_time="$(read_internal_seconds "$log_file" "Graph check")"
+    mapping_time="$(read_internal_seconds "$log_file" "Mapping check")"
+    root_check_time="$(read_internal_seconds "$log_file" "Root check")"
+    geom_check_time="$(read_internal_seconds "$log_file" "Geometric graph check")"
+    full_dim_check_time="$(read_internal_seconds "$log_file" "Full dimension check")"
+    check_time="$(read_internal_seconds "$log_file" "Check certificate")"
+    binary_time="$(read_internal_seconds "$log_file" "Generate and write binary certificate")"
+
+    echo
+    echo "Timing report for $base:"
+    echo "  lrs:                                      $(format_timing_with_lrs "$lrs_elapsed" "$lrs_elapsed")"
+    echo
+    echo "  Certificate creation:"
+    echo "    read and parse .ine:                    $(format_timing_with_lrs "$read_ine_time" "$lrs_elapsed")"
+    echo "    read and parse .ext:                    $(format_timing_with_lrs "$read_ext_time" "$lrs_elapsed")"
+    echo "    build vertices and facets:              $(format_timing_with_lrs "$build_items_time" "$lrs_elapsed")"
+    echo "    build facet graph:                      $(format_timing_with_lrs "$build_graph_time" "$lrs_elapsed")"
+    echo "    choose root vertex:                     $(format_timing_with_lrs "$choose_root_time" "$lrs_elapsed")"
+    echo "    build root certificate:                 $(format_timing_with_lrs "$build_root_time" "$lrs_elapsed")"
+    echo "    convert inequalities:                   $(format_timing_with_lrs "$inequalities_time" "$lrs_elapsed")"
+    echo "    build geometric graph and lifts:        $(format_timing_with_lrs "$geom_graph_time" "$lrs_elapsed")"
+    echo "    build full-dimensionality certificate:  $(format_timing_with_lrs "$full_dim_time" "$lrs_elapsed")"
+    echo "    assemble certificate value:             $(format_timing_with_lrs "$assemble_time" "$lrs_elapsed")"
+    echo "    total certificate creation:             $(format_timing_with_lrs "$create_time" "$lrs_elapsed")"
+    echo
+    echo "  Rust certificate check:"
+    echo "    prepare checker input:                  $(format_timing_with_lrs "$prepare_time" "$lrs_elapsed")"
+    echo "    inequality-file check:                  $(format_timing_with_lrs "$inequality_check_time" "$lrs_elapsed")"
+    echo "    well-formedness check:                  $(format_timing_with_lrs "$well_formedness_time" "$lrs_elapsed")"
+    echo "    uniqueness check:                       $(format_timing_with_lrs "$uniqueness_time" "$lrs_elapsed")"
+    echo "    feasibility check:                      $(format_timing_with_lrs "$feasibility_time" "$lrs_elapsed")"
+    echo "    graph check:                            $(format_timing_with_lrs "$graph_check_time" "$lrs_elapsed")"
+    echo "    mapping check:                          $(format_timing_with_lrs "$mapping_time" "$lrs_elapsed")"
+    echo "    root check:                             $(format_timing_with_lrs "$root_check_time" "$lrs_elapsed")"
+    echo "    geometric-graph check:                  $(format_timing_with_lrs "$geom_check_time" "$lrs_elapsed")"
+    echo "    full-dimension check:                   $(format_timing_with_lrs "$full_dim_check_time" "$lrs_elapsed")"
+    echo "    total certificate check:                $(format_timing_with_lrs "$check_time" "$lrs_elapsed")"
+    echo
+    echo "  Binary certificate:"
+    echo "    generate and write binary file:         $(format_timing_with_lrs "$binary_time" "$lrs_elapsed")"
 }
 
 run_checker() {
@@ -302,6 +432,54 @@ run_checker() {
         $CHECKER \
         "$ine_file" \
         "$cert_file"
+}
+
+read_internal_seconds() {
+    local log_file="$1"
+    local label="$2"
+
+    awk -v label="$label" '
+        index($0, label ":") == 1 {
+            print $(NF - 1)
+            exit
+        }
+    ' "$log_file"
+}
+
+report_json_io_comparison() {
+    local base="$1"
+    local generation_log="${DATA_DIR}/${base}-cert.log"
+    local reload_log="${DATA_DIR}/${base}-check.log"
+
+    local direct_prepare serialize_json write_json read_json
+    direct_prepare="$(read_internal_seconds "$generation_log" "Prepare in-memory checker input")"
+    serialize_json="$(read_internal_seconds "$generation_log" "Serialize JSON certificate")"
+    write_json="$(read_internal_seconds "$generation_log" "Write JSON certificate")"
+    read_json="$(read_internal_seconds "$reload_log" "Read certificate")"
+
+    echo
+    echo "=== JSON I/O comparison for $base ==="
+    echo "prepare checker input directly: $(format_elapsed_seconds "$direct_prepare")"
+    echo "serialize JSON:                $(format_elapsed_seconds "$serialize_json")"
+    echo "write JSON file:               $(format_elapsed_seconds "$write_json")"
+    echo "read JSON + parse integers:    $(format_elapsed_seconds "$read_json")"
+
+    if [[ -n "$direct_prepare" && -n "$serialize_json" && -n "$write_json" && -n "$read_json" ]]; then
+        awk \
+            -v direct="$direct_prepare" \
+            -v serialize="$serialize_json" \
+            -v write="$write_json" \
+            -v read="$read_json" \
+            'BEGIN {
+                roundtrip = serialize + write + read;
+                overhead = roundtrip - direct;
+                if (overhead < 0) overhead = 0;
+                printf "JSON round trip:               %.6f s\n", roundtrip;
+                printf "estimated avoidable overhead:  %.6f s\n", overhead;
+            }'
+    else
+        echo "estimated avoidable overhead:  unavailable (missing internal timing)"
+    fi
 }
 
 run_coq_binreader_test() {
@@ -395,13 +573,19 @@ run_one() {
         check)
             run_checker "$base"
             ;;
+        compare-io)
+            # The generation command checks the certificate directly in
+            # memory. The second command reloads the emitted JSON and runs the
+            # same checks, making the serialization/I/O overhead visible.
+            generate_certificate "$base"
+            run_checker "$base"
+            report_json_io_comparison "$base"
+            ;;
         coq)
             run_coq_binreader_test "$base"
             ;;
         all)
             compute_ext "$base"
-            generate_certificate "$base"
-            run_checker "$base"
             generate_binary_certificate "$base"
             run_coq_binreader_test "$base"
             ;;
@@ -423,6 +607,7 @@ Usage:
   $0 cert   BASE [BASE ...]
   $0 bin    BASE [BASE ...]
   $0 check  BASE [BASE ...]
+  $0 compare-io BASE [BASE ...]
   $0 coq    BASE [BASE ...]
   $0 all    BASE [BASE ...]
   $0 clean  BASE [BASE ...]
@@ -452,13 +637,20 @@ Examples:
   $0 cert cross_9 cross_10
   $0 bin cross_9
   $0 check cross_12
+  $0 compare-io cross_12
   $0 coq cross_9
   $0 clean cross_9 cross_10
 
 Timing:
   The ext step, i.e. lrsgmp, is used as the reference lrs time.
-  Other steps report both seconds and the ratio to that lrs time.
+  The binary pipeline reports every certificate-construction phase, every
+  Rust checker group, and binary generation/writing separately. Each value is
+  shown both in seconds and as a multiple of the measured lrs time.
   The reference is stored in ${DATA_DIR}/BASE-lrs.time.
+  The compare-io command reports the JSON round-trip cost relative to
+  preparing the checker input directly from the generated certificate.
+  The all command uses the production path and does not generate JSON:
+  lrs -> in-memory Rust check -> binary encoding -> Rocq check.
 
 Environment variables:
   DATA_DIR       directory containing input/output files, default: data
@@ -496,7 +688,7 @@ case "$cmd" in
         fi
         build_tools
         ;;
-    ext|cert|bin|check|coq|all|clean)
+    ext|cert|bin|check|compare-io|coq|all|clean)
         if [[ $# -lt 1 ]]; then
             echo "error: expected at least one basename" >&2
             usage

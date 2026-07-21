@@ -1,4 +1,4 @@
-use anyhow::{Context, Result};
+use anyhow::{anyhow, Context, Result};
 use num_bigint::BigInt;
 use serde::{Deserialize, Deserializer, Serialize};
 use std::fs;
@@ -220,6 +220,25 @@ fn parse_decimal<E: serde::de::Error>(value: &str) -> std::result::Result<BigInt
         .ok_or_else(|| E::custom("invalid decimal integer"))
 }
 
+fn parse_decimal_checked(value: &str) -> Result<BigInt> {
+    BigInt::parse_bytes(value.trim().as_bytes(), 10)
+        .ok_or_else(|| anyhow!("invalid decimal integer"))
+}
+
+fn parse_decimal_vec_checked(values: &[String]) -> Result<Vec<BigInt>> {
+    values
+        .iter()
+        .map(|value| parse_decimal_checked(value))
+        .collect()
+}
+
+fn parse_decimal_matrix_checked(values: &[Vec<String>]) -> Result<Vec<Vec<BigInt>>> {
+    values
+        .iter()
+        .map(|row| parse_decimal_vec_checked(row))
+        .collect()
+}
+
 fn deserialize_decimal<'de, D>(deserializer: D) -> std::result::Result<BigInt, D::Error>
 where
     D: Deserializer<'de>,
@@ -272,6 +291,85 @@ where
                 .collect::<std::result::Result<Vec<_>, D::Error>>()
         })
         .collect()
+}
+
+/// Builds the checker's typed representation directly from a generated
+/// certificate, without serializing or parsing JSON.
+pub fn parse_generated_certificate(raw: &Certificate) -> Result<ParsedCertificate> {
+    let inequalities = raw
+        .inequalities
+        .iter()
+        .map(|inequality| {
+            Ok(ParsedInequality {
+                a: parse_decimal_vec_checked(&inequality.a)?,
+                b: parse_decimal_checked(&inequality.b)?,
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+
+    let items = raw
+        .items
+        .iter()
+        .map(|item| {
+            Ok(ParsedVertexItem {
+                incident: item.incident.clone(),
+                vertex: ParsedVertexCoords {
+                    num: parse_decimal_vec_checked(&item.vertex.num)?,
+                    den: parse_decimal_checked(&item.vertex.den)?,
+                },
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+
+    let graph = ParsedSimplexGraph {
+        g: raw.graph.g.clone(),
+        lbl: raw
+            .graph
+            .lbl
+            .iter()
+            .map(|label| ParsedGraphLabel {
+                simplex: label.simplex.clone(),
+                owner: label.owner,
+            })
+            .collect(),
+    };
+
+    let full_dim = ParsedFullDimCertificate {
+        denominator: parse_decimal_checked(&raw.full_dim.denominator)?,
+        point: parse_decimal_vec_checked(&raw.full_dim.point)?,
+        directions: parse_decimal_matrix_checked(&raw.full_dim.directions)?,
+        left_inverse: parse_decimal_matrix_checked(&raw.full_dim.left_inverse)?,
+    };
+
+    let root = ParsedRoot {
+        simplex_id: raw.root.simplex_id,
+        inverse_incident_map: raw.root.inverse_incident_map.clone(),
+        basis_vectors: parse_decimal_matrix_checked(&raw.root.basis_vectors)?,
+        m_matrix: parse_decimal_matrix_checked(&raw.root.m_matrix)?,
+        q_vectors: raw
+            .root
+            .q_vectors
+            .iter()
+            .map(|weight| {
+                weight
+                    .iter()
+                    .map(|(index, value)| Ok((*index, parse_decimal_checked(value)?)))
+                    .collect::<Result<Vec<_>>>()
+            })
+            .collect::<Result<Vec<_>>>()?,
+    };
+
+    Ok(ParsedCertificate {
+        n_inequalities: raw.n_inequalities,
+        dimension: raw.dimension,
+        inequalities,
+        items,
+        graph,
+        neighbors: raw.neighbors.clone(),
+        geom_edge_lifts: raw.geom_edge_lifts.clone(),
+        full_dim,
+        root,
+    })
 }
 
 pub fn write_certificate(path: &str, cert: &Certificate, pretty: bool) -> Result<()> {

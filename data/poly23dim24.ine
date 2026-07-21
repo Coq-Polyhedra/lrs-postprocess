@@ -49,6 +49,7 @@ begin
  1 -100    0    0   18    0    0     0       0      0        0         0          0           0            0  100  1000    1000  10000  1000000  10000000  100000000  1000000000 -10000000000
 end
 allbases
+commondenom
 incidence
 printcobasis 1
 threads 0

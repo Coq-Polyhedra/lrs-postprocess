@@ -514,6 +514,7 @@ begin
 9 -1 0 0 0 0 0 0 0
 end
 allbases
+facetneighbors
 incidence
 printcobasis 1
 threads 0

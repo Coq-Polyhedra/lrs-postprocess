@@ -2,11 +2,12 @@ use anyhow::{anyhow, bail, Context, Result};
 use num_bigint::{BigInt, Sign};
 use num_integer::Integer;
 use num_traits::{One, Signed, Zero};
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{hash_map::Entry, BTreeMap, BTreeSet, HashMap};
 use std::fs;
+use std::hash::{BuildHasherDefault, Hasher};
 
 use crate::certificate::{Certificate, FullDimCertificate, GraphLabel, Inequality, Root, SimplexGraph, VertexCoords, VertexItem};
-use crate::numerics::{dot, identity, invert_matrix, mat_mul, parse_q, q_to_string, Q};
+use crate::numerics::{invert_matrix, parse_q, q_to_string, Q};
 
 #[derive(Debug, Clone)]
 pub struct HRep {
@@ -18,8 +19,13 @@ pub struct HRep {
 
 #[derive(Debug, Clone)]
 pub struct LrsRecord {
-    /// Vertex coordinates as strings, without the leading homogeneous coordinate.
+    /// Vertex numerators, or ordinary rational coordinate strings when
+    /// `common_den` is `None`.
     pub vertex: Vec<String>,
+
+    /// The common positive denominator emitted by lrs `commondenom` mode.
+    /// When present, `vertex` contains the corresponding primitive numerators.
+    pub common_den: Option<String>,
 
     /// Cobasis facets before `:` in the lrs incidence/cobasis line.
     /// Converted to 0-based row indices.
@@ -231,6 +237,11 @@ fn is_vertex_or_ray_row(line: &str, d: usize) -> bool {
 /// incidence
 /// printcobasis 1
 ///
+/// It also accepts the optimized `commondenom` output.  In that mode the row
+/// following a cobasis is:
+///
+/// *vertexcommon D N1 ... Nd
+///
 /// For a line like:
 ///
 /// V#1 R#0 B#1 h=0 facets  12 14 15 16 : 9 10 11 13 I#8 det= 8
@@ -327,12 +338,39 @@ pub fn parse_lrs_ext_records(path: &str, d: usize, m_ineq: usize) -> Result<Vec<
             let vline = lines[i].trim();
 
             if vline.is_empty()
-                || vline.starts_with('*')
+                || (vline.starts_with('*') && !vline.starts_with("*vertexcommon"))
                 || vline.eq_ignore_ascii_case("begin")
                 || vline.eq_ignore_ascii_case("end")
             {
                 i += 1;
                 continue;
+            }
+
+            if vline.starts_with("*vertexcommon") {
+                let vtoks: Vec<&str> = vline.split_whitespace().collect();
+                if vtoks.len() != d + 2 {
+                    bail!(
+                        "common-denominator vertex has {} values, expected {}, in line `{}`",
+                        vtoks.len().saturating_sub(1),
+                        d + 1,
+                        vline
+                    );
+                }
+
+                let den = vtoks[1];
+                if den == "0" || den == "-0" {
+                    bail!("common-denominator vertex has zero denominator in line `{vline}`");
+                }
+
+                records.push(LrsRecord {
+                    vertex: vtoks[2..].iter().map(|s| (*s).to_string()).collect(),
+                    common_den: Some(den.to_string()),
+                    cobasis,
+                    additional_incident: additional,
+                });
+
+                i += 1;
+                break;
             }
 
             if !is_vertex_or_ray_row(vline, d) {
@@ -349,6 +387,7 @@ pub fn parse_lrs_ext_records(path: &str, d: usize, m_ineq: usize) -> Result<Vec<
             if vtoks[0] == "1" {
                 records.push(LrsRecord {
                     vertex: vtoks[1..].iter().map(|s| (*s).to_string()).collect(),
+                    common_den: None,
                     cobasis,
                     additional_incident: additional,
                 });
@@ -368,7 +407,13 @@ pub fn build_items(records: Vec<LrsRecord>) -> Result<(Vec<VertexItem>, Vec<Grap
     let mut pending_labels: Vec<(Vec<usize>, VertexCoords)> = Vec::new();
 
     for rec in records {
-        let vertex = vertex_coords_from_strings(&rec.vertex)?;
+        let vertex = match rec.common_den {
+            Some(den) => VertexCoords {
+                num: rec.vertex,
+                den,
+            },
+            None => vertex_coords_from_strings(&rec.vertex)?,
+        };
 
         let mut incident = rec.cobasis.clone();
         incident.extend(rec.additional_incident.iter().copied());
@@ -439,46 +484,231 @@ pub fn build_items(records: Vec<LrsRecord>) -> Result<(Vec<VertexItem>, Vec<Grap
     Ok((items, lbl))
 }
 
-pub fn build_simplex_graph(lbl: Vec<GraphLabel>) -> Result<SimplexGraph> {
-    // For every ridge occurrence (node, r), store the unique adjacent node
-    // through the ridge obtained by deleting lbl[node].simplex[r].
-    let mut ridge_map: HashMap<Vec<usize>, Vec<(usize, usize)>> = HashMap::new();
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+struct RidgeFingerprint {
+    xor: u64,
+    sum: u64,
+}
 
-    for (node, label) in lbl.iter().enumerate() {
-        let sigma = &label.simplex;
-        for r in 0..sigma.len() {
-            let mut ridge = sigma.clone();
-            ridge.remove(r);
-            ridge_map.entry(ridge).or_default().push((node, r));
+impl RidgeFingerprint {
+    fn remove(self, value_fingerprint: (u64, u64)) -> Self {
+        let (x, y) = value_fingerprint;
+        Self {
+            xor: self.xor ^ x,
+            sum: self.sum.wrapping_sub(y),
         }
     }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct RidgeRef {
+    node: usize,
+    removed_pos: usize,
+}
+
+#[derive(Debug)]
+struct RidgeGroup {
+    first: RidgeRef,
+    paired: bool,
+}
+
+/// Normally a fingerprint identifies a single ridge, so keep that group
+/// inline. The vector is used only if distinct ridges have the same two-word
+/// fingerprint. Exact comparison below makes such collisions harmless.
+#[derive(Debug)]
+struct RidgeBucket {
+    first: RidgeGroup,
+    collisions: Vec<RidgeGroup>,
+}
+
+/// Ridge fingerprints have already been mixed. Avoid applying SipHash to both
+/// words on every incidence; exact key equality and `same_ridge` still handle
+/// all collisions.
+#[derive(Default)]
+struct RidgeKeyHasher(u64);
+
+impl Hasher for RidgeKeyHasher {
+    fn finish(&self) -> u64 {
+        self.0
+    }
+
+    fn write(&mut self, bytes: &[u8]) {
+        for &byte in bytes {
+            self.0 ^= u64::from(byte);
+            self.0 = self.0.wrapping_mul(0x0000_0100_0000_01b3);
+        }
+    }
+
+    fn write_u64(&mut self, value: u64) {
+        self.0 = (self.0 ^ value)
+            .wrapping_mul(0x9e37_79b9_7f4a_7c15)
+            .rotate_left(27);
+    }
+}
+
+type RidgeMap = HashMap<
+    RidgeFingerprint,
+    RidgeBucket,
+    BuildHasherDefault<RidgeKeyHasher>,
+>;
+
+fn mix64(mut x: u64) -> u64 {
+    x = x.wrapping_add(0x9e37_79b9_7f4a_7c15);
+    x = (x ^ (x >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+    x = (x ^ (x >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+    x ^ (x >> 31)
+}
+
+fn fingerprint_value(value: usize) -> (u64, u64) {
+    let value = value as u64;
+    (
+        mix64(value),
+        mix64(value ^ 0xd6e8_feb8_6659_fd93),
+    )
+}
+
+fn simplex_fingerprint(
+    simplex: &[usize],
+    value_fingerprints: &[(u64, u64)],
+) -> RidgeFingerprint {
+    let mut fingerprint = RidgeFingerprint { xor: 0, sum: 0 };
+    for &value in simplex {
+        let (x, y) = value_fingerprints[value];
+        fingerprint.xor ^= x;
+        fingerprint.sum = fingerprint.sum.wrapping_add(y);
+    }
+    fingerprint
+}
+
+fn same_ridge(lbl: &[GraphLabel], a: RidgeRef, b: RidgeRef) -> bool {
+    let sa = &lbl[a.node].simplex;
+    let sb = &lbl[b.node].simplex;
+
+    if sa.len() != sb.len()
+        || a.removed_pos >= sa.len()
+        || b.removed_pos >= sb.len()
+    {
+        return false;
+    }
+
+    // Both simplices are sorted. Compare the two views without allocating the
+    // vectors obtained by deleting the indicated positions.
+    for k in 0..sa.len().saturating_sub(1) {
+        let ia = k + if k >= a.removed_pos { 1 } else { 0 };
+        let ib = k + if k >= b.removed_pos { 1 } else { 0 };
+        if sa[ia] != sb[ib] {
+            return false;
+        }
+    }
+    true
+}
+
+fn materialize_ridge(lbl: &[GraphLabel], ridge: RidgeRef) -> Vec<usize> {
+    lbl[ridge.node]
+        .simplex
+        .iter()
+        .enumerate()
+        .filter_map(|(pos, &value)| (pos != ridge.removed_pos).then_some(value))
+        .collect()
+}
+
+pub fn build_simplex_graph(lbl: Vec<GraphLabel>) -> Result<SimplexGraph> {
+    // A ridge occurrence is represented only by its simplex and the position
+    // to skip. Its two-word fingerprint is obtained in O(1) after computing
+    // one fingerprint per simplex. Matching views are compared exactly, so
+    // fingerprint collisions can affect performance but never correctness.
+    let ridge_incidence_count = lbl
+        .iter()
+        .fold(0usize, |count, label| count.saturating_add(label.simplex.len()));
+    let mut ridge_map = RidgeMap::with_capacity_and_hasher(
+        ridge_incidence_count / 2,
+        BuildHasherDefault::default(),
+    );
+
+    // Row indices are dense in lrs certificates. Hash every possible row only
+    // once instead of running the mixing function for every occurrence.
+    let value_fingerprints = lbl
+        .iter()
+        .flat_map(|label| label.simplex.iter().copied())
+        .max()
+        .map(|max_value| (0..=max_value).map(fingerprint_value).collect::<Vec<_>>())
+        .unwrap_or_default();
 
     let mut g = lbl
         .iter()
         .map(|label| vec![usize::MAX; label.simplex.len()])
         .collect::<Vec<_>>();
 
-    for (ridge, occs) in ridge_map {
-        if occs.len() != 2 {
-            bail!(
-                "ridge {:?} has {} incident simplex occurrences, expected exactly 2",
-                ridge,
-                occs.len()
-            );
+    for (node, label) in lbl.iter().enumerate() {
+        let sigma = &label.simplex;
+        let simplex_fingerprint = simplex_fingerprint(sigma, &value_fingerprints);
+
+        for removed_pos in 0..sigma.len() {
+            let current = RidgeRef { node, removed_pos };
+            let fingerprint =
+                simplex_fingerprint.remove(value_fingerprints[sigma[removed_pos]]);
+
+            let bucket = match ridge_map.entry(fingerprint) {
+                Entry::Vacant(entry) => {
+                    entry.insert(RidgeBucket {
+                        first: RidgeGroup {
+                            first: current,
+                            paired: false,
+                        },
+                        collisions: Vec::new(),
+                    });
+                    continue;
+                }
+                Entry::Occupied(entry) => entry.into_mut(),
+            };
+
+            let group = if same_ridge(&lbl, bucket.first.first, current) {
+                &mut bucket.first
+            } else if let Some(pos) = bucket
+                .collisions
+                .iter()
+                .position(|group| same_ridge(&lbl, group.first, current))
+            {
+                &mut bucket.collisions[pos]
+            } else {
+                bucket.collisions.push(RidgeGroup {
+                    first: current,
+                    paired: false,
+                });
+                continue;
+            };
+
+            if group.paired {
+                bail!(
+                    "ridge {:?} has at least 3 incident simplex occurrences, expected exactly 2",
+                    materialize_ridge(&lbl, current)
+                );
+            }
+
+            let first = group.first;
+            if first.node == current.node {
+                bail!(
+                    "ridge {:?} is paired with two occurrences of the same graph node {}",
+                    materialize_ridge(&lbl, current),
+                    current.node
+                );
+            }
+
+            group.paired = true;
+            g[first.node][first.removed_pos] = current.node;
+            g[current.node][current.removed_pos] = first.node;
         }
+    }
 
-        let (a, ra) = occs[0];
-        let (b, rb) = occs[1];
-
-        if a == b {
-            bail!(
-                "ridge {:?} is paired with two occurrences of the same graph node {a}",
-                ridge
-            );
+    for bucket in ridge_map.values() {
+        for group in std::iter::once(&bucket.first).chain(bucket.collisions.iter()) {
+            if !group.paired {
+                bail!(
+                    "ridge {:?} has 1 incident simplex occurrence, expected exactly 2",
+                    materialize_ridge(&lbl, group.first)
+                );
+            }
         }
-
-        g[a][ra] = b;
-        g[b][rb] = a;
     }
 
     for (node, adj) in g.iter().enumerate() {
@@ -493,7 +723,7 @@ pub fn build_simplex_graph(lbl: Vec<GraphLabel>) -> Result<SimplexGraph> {
 }
 
 
-fn build_item_neighbors_and_lifts(
+pub fn build_item_neighbors_and_lifts(
     graph: &SimplexGraph,
     item_count: usize,
 ) -> Result<(Vec<Vec<usize>>, Vec<Vec<(usize, usize)>>)> {
@@ -954,7 +1184,7 @@ fn pivot_columns_by_row_echelon(matrix: &mut [Vec<Q>]) -> Vec<usize> {
     pivot_columns
 }
 
-fn build_full_dim_certificate(
+pub fn build_full_dim_certificate(
     items: &[VertexItem],
     neighbors: &[Vec<usize>],
     root_owner: usize,
@@ -1128,7 +1358,7 @@ fn integer_inequality_from_q_row(a: &[Q], b: &Q) -> Result<Inequality> {
     Ok(Inequality { a: coeffs, b: rhs })
 }
 
-fn certificate_inequalities(h: &HRep) -> Result<Vec<Inequality>> {
+pub fn certificate_inequalities(h: &HRep) -> Result<Vec<Inequality>> {
     h.a.iter()
         .zip(&h.b)
         .enumerate()

@@ -5,41 +5,21 @@ use num_traits::{One, Signed, Zero};
 use std::collections::VecDeque;
 use std::time::Instant;
 
-use crate::certificate::{read_certificate, Certificate};
+use crate::certificate::{
+    parse_generated_certificate, read_parsed_certificate, Certificate as GeneratedCertificate,
+    ParsedCertificate as Certificate, ParsedInequality,
+};
 use crate::numerics::q_to_string;
 use crate::postprocess::{parse_lrs_hrep, HRep};
 
-fn parse_bigint(s: &str) -> Option<BigInt> {
+// Parsing below is only for the external .ine file. All integers contained in
+// the certificate are parsed by read_parsed_certificate.
+fn parse_hrep_bigint(s: &str) -> Option<BigInt> {
     BigInt::parse_bytes(s.trim().as_bytes(), 10)
 }
 
-fn parse_bigint_vec(xs: &[String]) -> Option<Vec<BigInt>> {
-    xs.iter().map(|x| parse_bigint(x)).collect()
-}
-
-fn parse_bigint_matrix(
-    matrix: &[Vec<String>],
-    rows: usize,
-    columns: usize,
-) -> Option<Vec<Vec<BigInt>>> {
-    if matrix.len() != rows || matrix.iter().any(|row| row.len() != columns) {
-        return None;
-    }
-    matrix.iter().map(|row| parse_bigint_vec(row)).collect()
-}
-
-type ParsedInequality = (Vec<BigInt>, BigInt);
-
-fn parse_inequalities(cert: &Certificate) -> Option<Vec<ParsedInequality>> {
-    cert.inequalities
-        .iter()
-        .map(|inequality| {
-            Some((
-                parse_bigint_vec(&inequality.a)?,
-                parse_bigint(&inequality.b)?,
-            ))
-        })
-        .collect()
+fn has_matrix_shape<T>(matrix: &[Vec<T>], rows: usize, columns: usize) -> bool {
+    matrix.len() == rows && matrix.iter().all(|row| row.len() == columns)
 }
 
 fn dot(x: &[BigInt], y: &[BigInt]) -> Option<BigInt> {
@@ -53,20 +33,15 @@ fn dot(x: &[BigInt], y: &[BigInt]) -> Option<BigInt> {
     )
 }
 
-fn sparse_dot(weight: &[(usize, String)], x: &[BigInt]) -> Option<BigInt> {
+fn sparse_dot(weight: &[(usize, BigInt)], x: &[BigInt]) -> Option<BigInt> {
     let mut result = BigInt::zero();
     for (i, value) in weight {
-        let coefficient = parse_bigint(value)?;
-        result += coefficient * x.get(*i)?;
+        result += value * x.get(*i)?;
     }
     Some(result)
 }
 
 fn strictly_sorted(xs: &[usize]) -> bool {
-    xs.windows(2).all(|w| w[0] < w[1])
-}
-
-fn strictly_lexicographically_sorted(xs: &[Vec<usize>]) -> bool {
     xs.windows(2).all(|w| w[0] < w[1])
 }
 
@@ -118,9 +93,9 @@ fn is_undirected(graph: &[Vec<usize>]) -> bool {
 fn parse_rational_parts(s: &str) -> Option<(BigInt, BigInt)> {
     let s = s.trim();
     let (mut numerator, mut denominator) = if let Some((a, b)) = s.split_once('/') {
-        (parse_bigint(a)?, parse_bigint(b)?)
+        (parse_hrep_bigint(a)?, parse_hrep_bigint(b)?)
     } else {
-        (parse_bigint(s)?, BigInt::one())
+        (parse_hrep_bigint(s)?, BigInt::one())
     };
 
     if denominator.is_zero() {
@@ -168,18 +143,12 @@ fn check_ine_file(h: &HRep, cert: &Certificate) -> bool {
         && cert.dimension == h.d
         && cert.inequalities.len() == h.a.len()
         && cert.inequalities.iter().enumerate().all(|(i, inequality)| {
-            let Some(normal) = parse_bigint_vec(&inequality.a) else {
-                return false;
-            };
-            let Some(bound) = parse_bigint(&inequality.b) else {
-                return false;
-            };
             let Some((expected_normal, expected_bound)) =
                 integer_inequality_from_hrep(h, i)
             else {
                 return false;
             };
-            normal == expected_normal && bound == expected_bound
+            inequality.a == expected_normal && inequality.b == expected_bound
         })
 }
 
@@ -191,24 +160,14 @@ mod rocq {
     pub fn areInequalitiesWellFormed(cert: &Certificate) -> bool {
         cert.inequalities.len() == cert.n_inequalities
             && cert.inequalities.iter().all(|inequality| {
-                let Some(normal) = parse_bigint_vec(&inequality.a) else {
-                    return false;
-                };
-                parse_bigint(&inequality.b).is_some()
-                    && normal.len() == cert.dimension
-                    && normal.iter().any(|x| !x.is_zero())
+                inequality.a.len() == cert.dimension
+                    && inequality.a.iter().any(|x| !x.is_zero())
             })
     }
 
     pub fn arePointsWellFormed(cert: &Certificate) -> bool {
         cert.items.iter().all(|item| {
-            let Some(numerators) = parse_bigint_vec(&item.vertex.num) else {
-                return false;
-            };
-            let Some(denominator) = parse_bigint(&item.vertex.den) else {
-                return false;
-            };
-            denominator > BigInt::zero() && numerators.len() == cert.dimension
+            item.vertex.den > BigInt::zero() && item.vertex.num.len() == cert.dimension
         })
     }
 
@@ -320,31 +279,24 @@ mod rocq {
     }
 
     pub fn isFullDimPointWellFormed(cert: &Certificate) -> bool {
-        let Some(point) = parse_bigint_vec(&cert.full_dim.point) else {
-            return false;
-        };
-        let Some(denominator) = parse_bigint(&cert.full_dim.denominator) else {
-            return false;
-        };
-        denominator > BigInt::zero() && point.len() == cert.dimension
+        cert.full_dim.denominator > BigInt::zero()
+            && cert.full_dim.point.len() == cert.dimension
     }
 
     pub fn isFullDimDirWellFormed(cert: &Certificate) -> bool {
-        parse_bigint_matrix(
+        has_matrix_shape(
             &cert.full_dim.directions,
             cert.dimension,
             cert.dimension,
         )
-        .is_some()
     }
 
     pub fn isFullDimInverseWellFormed(cert: &Certificate) -> bool {
-        parse_bigint_matrix(
+        has_matrix_shape(
             &cert.full_dim.left_inverse,
             cert.dimension,
             cert.dimension,
         )
-        .is_some()
     }
 
     pub fn isFullDimWellFormed(cert: &Certificate) -> bool {
@@ -379,12 +331,11 @@ mod rocq {
     }
 
     pub fn areWitnessesWellFormed(cert: &Certificate) -> bool {
-        parse_bigint_matrix(
+        has_matrix_shape(
             &cert.root.basis_vectors,
             cert.dimension,
             cert.dimension,
         )
-        .is_some()
     }
 
     pub fn areScalarProductsWellFormed(cert: &Certificate) -> bool {
@@ -394,18 +345,18 @@ mod rocq {
         let Some(root_vertex) = cert.items.get(root_facet.owner) else {
             return false;
         };
-        parse_bigint_matrix(
+        has_matrix_shape(
             &cert.root.m_matrix,
             root_vertex.incident.len(),
             cert.dimension,
         )
-        .is_some()
     }
 
-    pub fn isSparseVectorWellFormed(dimension: usize, weight: &[(usize, String)]) -> bool {
-        weight.iter().all(|(i, value)| {
-            *i < dimension && parse_bigint(value).is_some_and(|x| !x.is_zero())
-        }) && weight.windows(2).all(|w| w[0].0 < w[1].0)
+    pub fn isSparseVectorWellFormed(dimension: usize, weight: &[(usize, BigInt)]) -> bool {
+        weight
+            .iter()
+            .all(|(i, value)| *i < dimension && !value.is_zero())
+            && weight.windows(2).all(|w| w[0].0 < w[1].0)
     }
 
     pub fn areWeightsWellFormed(cert: &Certificate) -> bool {
@@ -438,22 +389,16 @@ mod rocq {
     }
 
     pub fn areActiveSetsUnique(cert: &Certificate) -> bool {
-        let active_sets = cert
-            .items
-            .iter()
-            .map(|item| item.incident.clone())
-            .collect::<Vec<_>>();
-        strictly_lexicographically_sorted(&active_sets)
+        cert.items
+            .windows(2)
+            .all(|items| items[0].incident < items[1].incident)
     }
 
     pub fn areFacetsUnique(cert: &Certificate) -> bool {
-        let descriptions = cert
-            .graph
+        cert.graph
             .lbl
-            .iter()
-            .map(|facet| facet.simplex.clone())
-            .collect::<Vec<_>>();
-        strictly_lexicographically_sorted(&descriptions)
+            .windows(2)
+            .all(|facets| facets[0].simplex < facets[1].simplex)
     }
 
     pub fn check_ineqs(
@@ -464,11 +409,11 @@ mod rocq {
     ) -> bool {
         let mut active_position = 0;
 
-        for (i, (normal, bound)) in inequalities.iter().enumerate() {
-            let Some(lhs) = dot(normal, numerators) else {
+        for (i, inequality) in inequalities.iter().enumerate() {
+            let Some(lhs) = dot(&inequality.a, numerators) else {
                 return false;
             };
-            let rhs = bound * denominator;
+            let rhs = &inequality.b * denominator;
 
             if active_set.get(active_position) == Some(&i) {
                 if lhs != rhs {
@@ -484,23 +429,12 @@ mod rocq {
     }
 
     pub fn feasibility_check(cert: &Certificate) -> bool {
-        let Some(inequalities) = parse_inequalities(cert) else {
-            return false;
-        };
-
         cert.items.iter().all(|item| {
-            let Some(numerators) = parse_bigint_vec(&item.vertex.num) else {
-                return false;
-            };
-            let Some(denominator) = parse_bigint(&item.vertex.den) else {
-                return false;
-            };
-
             check_ineqs(
-                &inequalities,
+                &cert.inequalities,
                 &item.incident,
-                &numerators,
-                &denominator,
+                &item.vertex.num,
+                &item.vertex.den,
             )
         })
     }
@@ -542,20 +476,20 @@ mod rocq {
         let Some(root_vertex) = cert.items.get(root_facet.owner) else {
             return false;
         };
-        let Some(witnesses) = parse_bigint_matrix(
+        if !has_matrix_shape(
             &cert.root.basis_vectors,
             cert.dimension,
             cert.dimension,
-        ) else {
+        ) {
             return false;
-        };
-        let Some(products) = parse_bigint_matrix(
+        }
+        if !has_matrix_shape(
             &cert.root.m_matrix,
             root_vertex.incident.len(),
             cert.dimension,
-        ) else {
+        ) {
             return false;
-        };
+        }
 
         root_vertex
             .incident
@@ -565,12 +499,9 @@ mod rocq {
                 let Some(inequality) = cert.inequalities.get(row) else {
                     return false;
                 };
-                let Some(normal) = parse_bigint_vec(&inequality.a) else {
-                    return false;
-                };
                 (0..cert.dimension).all(|j| {
-                    dot(&normal, &witnesses[j])
-                        .is_some_and(|expected| products[i][j] == expected)
+                    dot(&inequality.a, &cert.root.basis_vectors[j])
+                        .is_some_and(|expected| cert.root.m_matrix[i][j] == expected)
                 })
             })
     }
@@ -582,13 +513,13 @@ mod rocq {
         let Some(root_vertex) = cert.items.get(root_facet.owner) else {
             return false;
         };
-        let Some(products) = parse_bigint_matrix(
+        if !has_matrix_shape(
             &cert.root.m_matrix,
             root_vertex.incident.len(),
             cert.dimension,
-        ) else {
+        ) {
             return false;
-        };
+        }
 
         root_facet
             .simplex
@@ -598,7 +529,7 @@ mod rocq {
                 let Some(&active_position) = cert.root.inverse_incident_map.get(row) else {
                     return false;
                 };
-                let Some(product_row) = products.get(active_position) else {
+                let Some(product_row) = cert.root.m_matrix.get(active_position) else {
                     return false;
                 };
                 (0..cert.dimension).all(|j| {
@@ -611,11 +542,11 @@ mod rocq {
             })
     }
 
-    pub fn isSparseVectorPositive(weight: &[(usize, String)]) -> bool {
+    pub fn isSparseVectorPositive(weight: &[(usize, BigInt)]) -> bool {
         !weight.is_empty()
-            && weight.iter().all(|(_, value)| {
-                parse_bigint(value).is_some_and(|x| x >= BigInt::zero())
-            })
+            && weight
+                .iter()
+                .all(|(_, value)| value >= &BigInt::zero())
     }
 
     pub fn separability_check(cert: &Certificate) -> bool {
@@ -625,13 +556,13 @@ mod rocq {
         let Some(root_vertex) = cert.items.get(root_facet.owner) else {
             return false;
         };
-        let Some(products) = parse_bigint_matrix(
+        if !has_matrix_shape(
             &cert.root.m_matrix,
             root_vertex.incident.len(),
             cert.dimension,
-        ) else {
+        ) {
             return false;
-        };
+        }
 
         let same_owner_nonroot = cert
             .graph
@@ -656,7 +587,7 @@ mod rocq {
                             else {
                                 return false;
                             };
-                            products.get(active_position).is_some_and(|product_row| {
+                            cert.root.m_matrix.get(active_position).is_some_and(|product_row| {
                                 sparse_dot(weight, product_row)
                                     .is_some_and(|value| value <= BigInt::zero())
                             })
@@ -779,58 +710,50 @@ mod rocq {
     }
 
     pub fn full_dim_feasibility_check(cert: &Certificate) -> bool {
-        let Some(point) = parse_bigint_vec(&cert.full_dim.point) else {
-            return false;
-        };
-        let Some(denominator) = parse_bigint(&cert.full_dim.denominator) else {
-            return false;
-        };
-        let Some(directions) = parse_bigint_matrix(
+        if !has_matrix_shape(
             &cert.full_dim.directions,
             cert.dimension,
             cert.dimension,
-        ) else {
+        ) {
             return false;
-        };
+        }
 
         cert.inequalities.iter().all(|inequality| {
-            let Some(normal) = parse_bigint_vec(&inequality.a) else {
+            let Some(base) = dot(&inequality.a, &cert.full_dim.point) else {
                 return false;
             };
-            let Some(bound) = parse_bigint(&inequality.b) else {
-                return false;
-            };
-            let Some(base) = dot(&normal, &point) else {
-                return false;
-            };
-            let rhs = bound * &denominator;
+            let rhs = &inequality.b * &cert.full_dim.denominator;
             base <= rhs
-                && directions.iter().all(|direction| {
-                    dot(&normal, direction)
+                && cert.full_dim.directions.iter().all(|direction| {
+                    dot(&inequality.a, direction)
                         .is_some_and(|increment| &base + increment <= rhs)
                 })
         })
     }
 
     pub fn full_dim_inverse_check(cert: &Certificate) -> bool {
-        let Some(directions) = parse_bigint_matrix(
+        if !has_matrix_shape(
             &cert.full_dim.directions,
             cert.dimension,
             cert.dimension,
-        ) else {
+        ) {
             return false;
-        };
-        let Some(inverse) = parse_bigint_matrix(
+        }
+        if !has_matrix_shape(
             &cert.full_dim.left_inverse,
             cert.dimension,
             cert.dimension,
-        ) else {
+        ) {
             return false;
-        };
+        }
 
         (0..cert.dimension).all(|i| {
             (0..cert.dimension).all(|j| {
-                dot(&directions[i], &inverse[j]).is_some_and(|value| {
+                dot(
+                    &cert.full_dim.directions[i],
+                    &cert.full_dim.left_inverse[j],
+                )
+                .is_some_and(|value| {
                     if i == j {
                         !value.is_zero()
                     } else {
@@ -893,31 +816,20 @@ fn timed_bool(name: &str, check: impl FnOnce() -> bool) -> bool {
     result
 }
 
-pub fn check_certificate(ine_path: &str, certificate_path: &str) -> Result<()> {
-    let start = Instant::now();
-    let h = parse_lrs_hrep(ine_path).context("failed to parse H-representation")?;
-    eprintln!(
-        "Parse H-representation: {:.6} s",
-        start.elapsed().as_secs_f64()
-    );
-
-    let start = Instant::now();
-    let cert = read_certificate(certificate_path)?;
-    eprintln!("Read certificate: {:.6} s", start.elapsed().as_secs_f64());
-
+fn check_parsed_certificate(h: &HRep, cert: &Certificate) -> Result<()> {
     let inequality_file_check =
-        timed_bool("Inequality file check", || check_ine_file(&h, &cert));
+        timed_bool("Inequality file check", || check_ine_file(h, cert));
     let well_formedness =
-        timed_bool("Well-formedness check", || rocq::well_formedness_check(&cert));
-    let uniqueness = timed_bool("Uniqueness check", || rocq::uniqueness_check(&cert));
-    let feasibility = timed_bool("Feasibility check", || rocq::feasibility_check(&cert));
-    let graph = timed_bool("Graph check", || rocq::graph_check(&cert));
-    let mapping = timed_bool("Mapping check", || rocq::mapping_check(&cert));
-    let root = timed_bool("Root check", || rocq::root_check(&cert));
+        timed_bool("Well-formedness check", || rocq::well_formedness_check(cert));
+    let uniqueness = timed_bool("Uniqueness check", || rocq::uniqueness_check(cert));
+    let feasibility = timed_bool("Feasibility check", || rocq::feasibility_check(cert));
+    let graph = timed_bool("Graph check", || rocq::graph_check(cert));
+    let mapping = timed_bool("Mapping check", || rocq::mapping_check(cert));
+    let root = timed_bool("Root check", || rocq::root_check(cert));
     let geometric_graph =
-        timed_bool("Geometric graph check", || rocq::geom_graph_check(&cert));
+        timed_bool("Geometric graph check", || rocq::geom_graph_check(cert));
     let full_dimension =
-        timed_bool("Full dimension check", || rocq::full_dim_check(&cert));
+        timed_bool("Full dimension check", || rocq::full_dim_check(cert));
 
     let accepted = inequality_file_check
         && well_formedness
@@ -932,4 +844,31 @@ pub fn check_certificate(ine_path: &str, certificate_path: &str) -> Result<()> {
     accepted
         .then_some(())
         .ok_or_else(|| anyhow!("certificate rejected"))
+}
+
+/// Checks a certificate immediately after generation, without a JSON
+/// serialization/write/read/parse round trip.
+pub fn check_generated_certificate(h: &HRep, generated: &GeneratedCertificate) -> Result<()> {
+    let start = Instant::now();
+    let cert = parse_generated_certificate(generated)?;
+    eprintln!(
+        "Prepare in-memory checker input: {:.6} s",
+        start.elapsed().as_secs_f64()
+    );
+    check_parsed_certificate(h, &cert)
+}
+
+pub fn check_certificate(ine_path: &str, certificate_path: &str) -> Result<()> {
+    let start = Instant::now();
+    let h = parse_lrs_hrep(ine_path).context("failed to parse H-representation")?;
+    eprintln!(
+        "Parse H-representation: {:.6} s",
+        start.elapsed().as_secs_f64()
+    );
+
+    let start = Instant::now();
+    let cert = read_parsed_certificate(certificate_path)?;
+    eprintln!("Read certificate: {:.6} s", start.elapsed().as_secs_f64());
+
+    check_parsed_certificate(&h, &cert)
 }
