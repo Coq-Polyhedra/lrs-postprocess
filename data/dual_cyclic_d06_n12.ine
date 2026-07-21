@@ -20,6 +20,7 @@ begin
 6 36 -125 1296 -5501 46656 -212765
 end
 allbases
+commondenom
 incidence
 printcobasis 1
 threads 0

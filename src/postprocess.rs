@@ -1,12 +1,10 @@
 use anyhow::{anyhow, bail, Context, Result};
-use num_bigint::{BigInt, Sign};
-use num_integer::Integer;
-use num_traits::{One, Signed, Zero};
-use std::collections::{hash_map::Entry, BTreeMap, BTreeSet, HashMap};
+use rug::{Complete, Integer};
+use std::collections::{hash_map::Entry, BTreeMap, HashMap};
 use std::fs;
 use std::hash::{BuildHasherDefault, Hasher};
 
-use crate::certificate::{Certificate, FullDimCertificate, GraphLabel, Inequality, Root, SimplexGraph, VertexCoords, VertexItem};
+use crate::certificate::{FullDimCertificate, GraphLabel, Inequality, Root, SimplexGraph, VertexCoords, VertexItem};
 use crate::numerics::{invert_matrix, parse_q, q_to_string, Q};
 
 #[derive(Debug, Clone)]
@@ -19,13 +17,7 @@ pub struct HRep {
 
 #[derive(Debug, Clone)]
 pub struct LrsRecord {
-    /// Vertex numerators, or ordinary rational coordinate strings when
-    /// `common_den` is `None`.
-    pub vertex: Vec<String>,
-
-    /// The common positive denominator emitted by lrs `commondenom` mode.
-    /// When present, `vertex` contains the corresponding primitive numerators.
-    pub common_den: Option<String>,
+    pub vertex: LrsVertex,
 
     /// Cobasis facets before `:` in the lrs incidence/cobasis line.
     /// Converted to 0-based row indices.
@@ -36,41 +28,27 @@ pub struct LrsRecord {
     pub additional_incident: Vec<usize>,
 }
 
+#[derive(Debug, Clone)]
+pub enum LrsVertex {
+    /// Ordinary lrs row, without its leading homogeneous coordinate.
+    Coordinates(Vec<String>),
 
-fn parse_rational_parts(s: &str) -> Result<(BigInt, BigInt)> {
-    let s = s.trim();
+    /// Primitive common-denominator row emitted by the `commondenom` option.
+    CommonDenominator {
+        denominator: String,
+        numerators: Vec<String>,
+    },
+}
 
-    let (mut num, mut den) = if let Some((a, b)) = s.split_once('/') {
-        let num = BigInt::parse_bytes(a.trim().as_bytes(), 10)
-            .ok_or_else(|| anyhow!("invalid rational numerator `{}`", a.trim()))?;
-        let den = BigInt::parse_bytes(b.trim().as_bytes(), 10)
-            .ok_or_else(|| anyhow!("invalid rational denominator `{}`", b.trim()))?;
-        (num, den)
-    } else {
-        let num = BigInt::parse_bytes(s.as_bytes(), 10)
-            .ok_or_else(|| anyhow!("invalid integer rational `{s}`"))?;
-        (num, BigInt::one())
-    };
 
-    if den.is_zero() {
-        bail!("invalid rational `{s}` with zero denominator");
-    }
-
-    if den.sign() == Sign::Minus {
-        num = -num;
-        den = -den;
-    }
-
-    let g = num.abs().gcd(&den);
-    num /= &g;
-    den /= &g;
-
-    Ok((num, den))
+fn parse_rational_parts(s: &str) -> Result<(Integer, Integer)> {
+    let value = parse_q(s)?;
+    Ok((value.numer().clone(), value.denom().clone()))
 }
 
 fn vertex_coords_from_strings(v: &[String]) -> Result<VertexCoords> {
-    let mut nums = Vec::<BigInt>::with_capacity(v.len());
-    let mut dens = Vec::<BigInt>::with_capacity(v.len());
+    let mut nums = Vec::<Integer>::with_capacity(v.len());
+    let mut dens = Vec::<Integer>::with_capacity(v.len());
 
     for s in v {
         let (num, den) = parse_rational_parts(s)
@@ -81,17 +59,52 @@ fn vertex_coords_from_strings(v: &[String]) -> Result<VertexCoords> {
 
     let lcm = dens
         .iter()
-        .fold(BigInt::one(), |acc, den| acc.lcm(den));
+        .fold(Integer::from(1), |acc, den| acc.lcm_ref(den).complete());
 
     let cleared = nums
         .iter()
         .zip(&dens)
-        .map(|(num, den)| (num * (&lcm / den)).to_string())
+        .map(|(num, den)| {
+            let mut value = num.clone();
+            value *= (&lcm / den).complete();
+            value.to_string()
+        })
         .collect();
 
     Ok(VertexCoords {
         num: cleared,
         den: lcm.to_string(),
+    })
+}
+
+fn vertex_coords_from_common_denominator(
+    denominator: String,
+    numerators: Vec<String>,
+) -> Result<VertexCoords> {
+    let denominator = Integer::parse(denominator.trim())
+        .ok()
+        .map(Integer::from)
+        .context("invalid common vertex denominator")?;
+
+    if denominator <= 0 {
+        bail!("common vertex denominator must be positive, got {denominator}");
+    }
+
+    let numerators = numerators
+        .into_iter()
+        .enumerate()
+        .map(|(j, numerator)| {
+            Integer::parse(numerator.trim())
+                .ok()
+                .map(Integer::from)
+                .map(|value| value.to_string())
+                .with_context(|| format!("invalid common vertex numerator {j}: `{numerator}`"))
+        })
+        .collect::<Result<Vec<_>>>()?;
+
+    Ok(VertexCoords {
+        num: numerators,
+        den: denominator.to_string(),
     })
 }
 
@@ -237,11 +250,6 @@ fn is_vertex_or_ray_row(line: &str, d: usize) -> bool {
 /// incidence
 /// printcobasis 1
 ///
-/// It also accepts the optimized `commondenom` output.  In that mode the row
-/// following a cobasis is:
-///
-/// *vertexcommon D N1 ... Nd
-///
 /// For a line like:
 ///
 /// V#1 R#0 B#1 h=0 facets  12 14 15 16 : 9 10 11 13 I#8 det= 8
@@ -331,46 +339,46 @@ pub fn parse_lrs_ext_records(path: &str, d: usize, m_ineq: usize) -> Result<Vec<
             );
         }
 
-        // Pair this cobasis/incidence line with the next output row.
+        // Pair this cobasis/incidence line with the next output row.  A
+        // `*vertexcommon` line is data, despite using lrs's usual comment
+        // prefix, so recognize it before skipping other `*` lines.
         i += 1;
 
         while i < lines.len() {
             let vline = lines[i].trim();
 
-            if vline.is_empty()
-                || (vline.starts_with('*') && !vline.starts_with("*vertexcommon"))
-                || vline.eq_ignore_ascii_case("begin")
-                || vline.eq_ignore_ascii_case("end")
-            {
-                i += 1;
-                continue;
-            }
+            let vtoks: Vec<&str> = vline.split_whitespace().collect();
 
-            if vline.starts_with("*vertexcommon") {
-                let vtoks: Vec<&str> = vline.split_whitespace().collect();
+            if vtoks.first() == Some(&"*vertexcommon") {
                 if vtoks.len() != d + 2 {
                     bail!(
-                        "common-denominator vertex has {} values, expected {}, in line `{}`",
+                        "common-denominator vertex row has {} values after its tag, expected {} (denominator plus {d} numerators): `{}`",
                         vtoks.len().saturating_sub(1),
                         d + 1,
                         vline
                     );
                 }
 
-                let den = vtoks[1];
-                if den == "0" || den == "-0" {
-                    bail!("common-denominator vertex has zero denominator in line `{vline}`");
-                }
-
                 records.push(LrsRecord {
-                    vertex: vtoks[2..].iter().map(|s| (*s).to_string()).collect(),
-                    common_den: Some(den.to_string()),
+                    vertex: LrsVertex::CommonDenominator {
+                        denominator: vtoks[1].to_string(),
+                        numerators: vtoks[2..].iter().map(|s| (*s).to_string()).collect(),
+                    },
                     cobasis,
                     additional_incident: additional,
                 });
 
                 i += 1;
                 break;
+            }
+
+            if vline.is_empty()
+                || vline.starts_with('*')
+                || vline.eq_ignore_ascii_case("begin")
+                || vline.eq_ignore_ascii_case("end")
+            {
+                i += 1;
+                continue;
             }
 
             if !is_vertex_or_ray_row(vline, d) {
@@ -381,13 +389,12 @@ pub fn parse_lrs_ext_records(path: &str, d: usize, m_ineq: usize) -> Result<Vec<
                 );
             }
 
-            let vtoks: Vec<&str> = vline.split_whitespace().collect();
-
             // Keep only vertices. Ignore rays.
             if vtoks[0] == "1" {
                 records.push(LrsRecord {
-                    vertex: vtoks[1..].iter().map(|s| (*s).to_string()).collect(),
-                    common_den: None,
+                    vertex: LrsVertex::Coordinates(
+                        vtoks[1..].iter().map(|s| (*s).to_string()).collect(),
+                    ),
                     cobasis,
                     additional_incident: additional,
                 });
@@ -407,12 +414,12 @@ pub fn build_items(records: Vec<LrsRecord>) -> Result<(Vec<VertexItem>, Vec<Grap
     let mut pending_labels: Vec<(Vec<usize>, VertexCoords)> = Vec::new();
 
     for rec in records {
-        let vertex = match rec.common_den {
-            Some(den) => VertexCoords {
-                num: rec.vertex,
-                den,
-            },
-            None => vertex_coords_from_strings(&rec.vertex)?,
+        let vertex = match rec.vertex {
+            LrsVertex::Coordinates(coordinates) => vertex_coords_from_strings(&coordinates)?,
+            LrsVertex::CommonDenominator {
+                denominator,
+                numerators,
+            } => vertex_coords_from_common_denominator(denominator, numerators)?,
         };
 
         let mut incident = rec.cobasis.clone();
@@ -814,27 +821,33 @@ pub fn choose_default_k0(items: &[VertexItem], graph: &SimplexGraph) -> Result<u
 
 
 
-fn q_from_bigint(x: &BigInt) -> Q {
-    Q::from_integer(x.clone())
+fn q_from_integer(x: &Integer) -> Q {
+    Q::from(x.clone())
 }
 
-fn dot_bigint(a: &[BigInt], x: &[BigInt]) -> BigInt {
-    a.iter()
-        .zip(x)
-        .fold(BigInt::zero(), |acc, (ai, xi)| acc + ai * xi)
+fn dot_integer(a: &[Integer], x: &[Integer]) -> Integer {
+    let mut result = Integer::new();
+    for (ai, xi) in a.iter().zip(x) {
+        result += ai * xi;
+    }
+    result
 }
 
-fn clear_q_vec_to_bigints(xs: &[Q]) -> Vec<BigInt> {
+fn clear_q_vec_to_integers(xs: &[Q]) -> Vec<Integer> {
     let lcm = xs
         .iter()
-        .fold(BigInt::one(), |acc, x| acc.lcm(x.denom()));
+        .fold(Integer::from(1), |acc, x| acc.lcm_ref(x.denom()).complete());
 
     xs.iter()
-        .map(|x| x.numer() * (&lcm / x.denom()))
+        .map(|x| {
+            let mut value = x.numer().clone();
+            value *= (&lcm / x.denom()).complete();
+            value
+        })
         .collect()
 }
 
-fn integer_inequality_coefficients(h: &HRep) -> Result<Vec<Vec<BigInt>>> {
+fn integer_inequality_coefficients(h: &HRep) -> Result<Vec<Vec<Integer>>> {
     h.a.iter()
         .zip(&h.b)
         .enumerate()
@@ -847,7 +860,10 @@ fn integer_inequality_coefficients(h: &HRep) -> Result<Vec<Vec<BigInt>>> {
                 .iter()
                 .enumerate()
                 .map(|(j, s)| {
-                    BigInt::parse_bytes(s.as_bytes(), 10).ok_or_else(|| {
+                    Integer::parse(s)
+                        .ok()
+                        .map(Integer::from)
+                        .ok_or_else(|| {
                         anyhow!("internal error: cleared coefficient {j} of inequality {i} is not an integer: {s}")
                     })
                 })
@@ -856,12 +872,12 @@ fn integer_inequality_coefficients(h: &HRep) -> Result<Vec<Vec<BigInt>>> {
         .collect()
 }
 
-fn root_integer_basis_vectors(a_int: &[Vec<BigInt>], rows: &[usize], d: usize) -> Result<Vec<Vec<BigInt>>> {
-    let mut root_matrix = vec![vec![Q::zero(); d]; d];
+fn root_integer_basis_vectors(a_int: &[Vec<Integer>], rows: &[usize], d: usize) -> Result<Vec<Vec<Integer>>> {
+    let mut root_matrix = vec![vec![Q::new(); d]; d];
 
     for (r, &row_id) in rows.iter().enumerate() {
         for c in 0..d {
-            root_matrix[r][c] = q_from_bigint(&a_int[row_id][c]);
+            root_matrix[r][c] = q_from_integer(&a_int[row_id][c]);
         }
     }
 
@@ -870,20 +886,20 @@ fn root_integer_basis_vectors(a_int: &[Vec<BigInt>], rows: &[usize], d: usize) -
     let mut basis = Vec::with_capacity(d);
     for j in 0..d {
         let col = (0..d).map(|r| inv[r][j].clone()).collect::<Vec<_>>();
-        let f_j = clear_q_vec_to_bigints(&col);
+        let f_j = clear_q_vec_to_integers(&col);
         basis.push(f_j);
     }
 
     Ok(basis)
 }
 
-fn build_root_m_matrix(a_int: &[Vec<BigInt>], incident: &[usize], basis: &[Vec<BigInt>]) -> Vec<Vec<BigInt>> {
+fn build_root_m_matrix(a_int: &[Vec<Integer>], incident: &[usize], basis: &[Vec<Integer>]) -> Vec<Vec<Integer>> {
     incident
         .iter()
         .map(|&row_id| {
             basis
                 .iter()
-                .map(|f_j| dot_bigint(&a_int[row_id], f_j))
+                .map(|f_j| dot_integer(&a_int[row_id], f_j))
                 .collect()
         })
         .collect()
@@ -922,26 +938,28 @@ where
 fn solve_square_q(a: &[Vec<Q>], b: &[Q]) -> Option<Vec<Q>> {
     let inv = invert_matrix(a).ok()?;
     let n = b.len();
-    let mut x = vec![Q::zero(); n];
+    let mut x = vec![Q::new(); n];
 
     for i in 0..n {
         for j in 0..n {
-            x[i] += &inv[i][j] * &b[j];
+            let term: Q = (&inv[i][j] * &b[j]).complete();
+            x[i] += &term;
         }
     }
 
     Some(x)
 }
 
-fn q_dot_bigint_row(row: &[BigInt], x: &[Q], support: &[usize]) -> Q {
-    support
-        .iter()
-        .zip(x)
-        .fold(Q::zero(), |acc, (&j, xj)| acc + q_from_bigint(&row[j]) * xj)
+fn q_dot_integer_row(row: &[Integer], x: &[Q], support: &[usize]) -> Q {
+    let mut result = Q::new();
+    for (&j, xj) in support.iter().zip(x) {
+        result += q_from_integer(&row[j]) * xj;
+    }
+    result
 }
 
 fn sparse_nonnegative_certificate_for_simplex(
-    m_matrix: &[Vec<BigInt>],
+    m_matrix: &[Vec<Integer>],
     incident: &[usize],
     simplex: &[usize],
     d: usize,
@@ -965,41 +983,41 @@ fn sparse_nonnegative_certificate_for_simplex(
             let active_size = support_size - 1;
             combinations_until(constraint_rows.len(), active_size, &mut |active| {
                 let mut eqs = Vec::<Vec<Q>>::with_capacity(support_size);
-                eqs.push(vec![Q::one(); support_size]);
+                eqs.push(vec![Q::from(1); support_size]);
                 for &row_idx in active {
                     eqs.push(
                         support
                             .iter()
-                            .map(|&j| q_from_bigint(&constraint_rows[row_idx][j]))
+                            .map(|&j| q_from_integer(&constraint_rows[row_idx][j]))
                             .collect(),
                     );
                 }
 
-                let mut rhs = vec![Q::zero(); support_size];
-                rhs[0] = Q::one();
+                let mut rhs = vec![Q::new(); support_size];
+                rhs[0] = Q::from(1);
 
                 let x = solve_square_q(&eqs, &rhs)?;
 
-                if x.iter().any(|v| v < &Q::zero()) {
+                if x.iter().any(|v| v < &0) {
                     return None;
                 }
 
-                if x.iter().all(|v| v.is_zero()) {
+                if x.iter().all(|v| v == &0) {
                     return None;
                 }
 
                 if constraint_rows
                     .iter()
-                    .any(|row| q_dot_bigint_row(row, &x, support) > Q::zero())
+                    .any(|row| q_dot_integer_row(row, &x, support) > 0)
                 {
                     return None;
                 }
 
-                let coeffs = clear_q_vec_to_bigints(&x);
+                let coeffs = clear_q_vec_to_integers(&x);
                 let sparse = support
                     .iter()
                     .zip(coeffs.iter())
-                    .filter(|(_, c)| !c.is_zero())
+                    .filter(|(_, c)| *c != &0)
                     .map(|(&j, c)| (j, c.to_string()))
                     .collect::<Vec<_>>();
 
@@ -1054,12 +1072,12 @@ pub fn root_certificate(h: &HRep, items: &[VertexItem], graph: &SimplexGraph, k0
         for j in 0..h.d {
             let val = &m_matrix[local_pos][j];
             if j == root_pos {
-                if val <= &BigInt::zero() {
+                if val <= &0 {
                     bail!(
                         "root diagonal condition failed for row {row}, column {j}: expected > 0, got {val}"
                     );
                 }
-            } else if !val.is_zero() {
+            } else if val != &0 {
                 bail!(
                     "root off-diagonal condition failed for row {row}, column {j}: expected 0, got {val}"
                 );
@@ -1123,9 +1141,11 @@ fn vertex_coords_to_q(vertex: &VertexCoords, d: usize) -> Result<Vec<Q>> {
             vertex.num.len()
         );
     }
-    let den = BigInt::parse_bytes(vertex.den.trim().as_bytes(), 10)
+    let den = Integer::parse(vertex.den.trim())
+        .ok()
+        .map(Integer::from)
         .ok_or_else(|| anyhow!("invalid vertex denominator `{}`", vertex.den))?;
-    if den <= BigInt::zero() {
+    if den <= 0 {
         bail!("vertex denominator must be positive, got {den}");
     }
     vertex
@@ -1133,9 +1153,11 @@ fn vertex_coords_to_q(vertex: &VertexCoords, d: usize) -> Result<Vec<Q>> {
         .iter()
         .enumerate()
         .map(|(j, x)| {
-            let num = BigInt::parse_bytes(x.trim().as_bytes(), 10)
+            let num = Integer::parse(x.trim())
+                .ok()
+                .map(Integer::from)
                 .ok_or_else(|| anyhow!("invalid vertex numerator at coordinate {j}: `{x}`"))?;
-            Ok(Q::new(num, den.clone()))
+            Ok(Q::from((num, den.clone())))
         })
         .collect()
 }
@@ -1155,7 +1177,7 @@ fn pivot_columns_by_row_echelon(matrix: &mut [Vec<Q>]) -> Vec<usize> {
             break;
         }
 
-        let Some(pivot) = (pivot_row..nrows).find(|&r| !matrix[r][col].is_zero()) else {
+        let Some(pivot) = (pivot_row..nrows).find(|&r| matrix[r][col] != 0) else {
             continue;
         };
 
@@ -1165,12 +1187,12 @@ fn pivot_columns_by_row_echelon(matrix: &mut [Vec<Q>]) -> Vec<usize> {
         // It is enough to eliminate below the pivot.  We do not normalize the
         // pivot row, which avoids many rational divisions and gcd reductions.
         for r in (pivot_row + 1)..nrows {
-            if matrix[r][col].is_zero() {
+            if matrix[r][col] == 0 {
                 continue;
             }
 
             let factor = matrix[r][col].clone() / pivot_value.clone();
-            matrix[r][col] = Q::zero();
+            matrix[r][col] = Q::new();
             for c in (col + 1)..ncols {
                 let correction = factor.clone() * matrix[pivot_row][c].clone();
                 matrix[r][c] -= correction;
@@ -1212,7 +1234,7 @@ pub fn build_full_dim_certificate(
     let x0 = vertex_coords_to_q(&root_item.vertex, d)?;
 
     // Build once the d x deg(v*) rational matrix whose columns are w - v*.
-    let mut edge_matrix = vec![vec![Q::zero(); root_neighbors.len()]; d];
+    let mut edge_matrix = vec![vec![Q::new(); root_neighbors.len()]; d];
     for (col, &neighbor) in root_neighbors.iter().enumerate() {
         let w_item = items.get(neighbor).ok_or_else(|| {
             anyhow!(
@@ -1249,31 +1271,35 @@ pub fn build_full_dim_certificate(
         .map(|&neighbor| vertex_coords_to_q(&items[neighbor].vertex, d))
         .collect::<Result<Vec<_>>>()?;
 
-    let mut q = BigInt::one();
+    let mut q = Integer::from(1);
     for coord in &x0 {
-        q = q.lcm(coord.denom());
+        q = q.lcm_ref(coord.denom()).complete();
     }
     for x in &selected_points {
         for coord in x {
-            q = q.lcm(coord.denom());
+            q = q.lcm_ref(coord.denom()).complete();
         }
     }
-    if q <= BigInt::zero() {
+    if q <= 0 {
         bail!("internal error: common denominator for full-dimensionality certificate is {q}");
     }
 
     let p = x0
         .iter()
-        .map(|x| x.numer() * (&q / x.denom()))
+        .map(|x| {
+            let mut value = x.numer().clone();
+            value *= (&q / x.denom()).complete();
+            value
+        })
         .collect::<Vec<_>>();
 
     // Store R by columns: r[j] is the integer direction numerator
     // q (w^j - v*).
-    let mut r = vec![vec![BigInt::zero(); d]; d];
+    let mut r = vec![vec![Integer::new(); d]; d];
     for j in 0..d {
         for k in 0..d {
-            let w_num = selected_points[j][k].numer()
-                * (&q / selected_points[j][k].denom());
+            let mut w_num = selected_points[j][k].numer().clone();
+            w_num *= (&q / selected_points[j][k].denom()).complete();
             r[j][k] = w_num - &p[k];
         }
     }
@@ -1283,7 +1309,7 @@ pub fn build_full_dim_certificate(
     let r_q = (0..d)
         .map(|k| {
             (0..d)
-                .map(|j| Q::from_integer(r[j][k].clone()))
+                .map(|j| Q::from(r[j][k].clone()))
                 .collect::<Vec<_>>()
         })
         .collect::<Vec<_>>();
@@ -1291,13 +1317,13 @@ pub fn build_full_dim_certificate(
         "pivot columns unexpectedly produced a singular integer direction matrix",
     )?;
 
-    let mut scale = BigInt::one();
+    let mut scale = Integer::from(1);
     for row in &inv {
         for x in row {
-            scale = scale.lcm(x.denom());
+            scale = scale.lcm_ref(x.denom()).complete();
         }
     }
-    if scale <= BigInt::zero() {
+    if scale <= 0 {
         bail!("internal error: inverse-matrix denominator scale is {scale}");
     }
 
@@ -1305,7 +1331,11 @@ pub fn build_full_dim_certificate(
         .iter()
         .map(|row| {
             row.iter()
-                .map(|x| x.numer() * (&scale / x.denom()))
+                .map(|x| {
+                    let mut value = x.numer().clone();
+                    value *= (&scale / x.denom()).complete();
+                    value
+                })
                 .collect::<Vec<_>>()
         })
         .collect::<Vec<_>>();
@@ -1324,9 +1354,59 @@ pub fn build_full_dim_certificate(
     })
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::PathBuf;
+
+    fn temporary_ext_path(name: &str) -> PathBuf {
+        std::env::temp_dir().join(format!(
+            "lrs-postprocess-{name}-{}-{}.ext",
+            std::process::id(),
+            std::thread::current().name().unwrap_or("test")
+        ))
+    }
+
+    #[test]
+    fn parses_consecutive_common_denominator_vertices() {
+        let path = temporary_ext_path("vertexcommon");
+        let ext = "\
+V#1 R#0 B#1 h=0 facets  1 2 I#2 det= 1
+*vertexcommon 3 1 -2
+V#2 R#0 B#2 h=1 facets  3 4 I#2 det= 1
+*vertexcommon 5 6 7
+";
+        fs::write(&path, ext).unwrap();
+
+        let records = parse_lrs_ext_records(path.to_str().unwrap(), 2, 4).unwrap();
+        let _ = fs::remove_file(&path);
+
+        assert_eq!(records.len(), 2);
+
+        match &records[0].vertex {
+            LrsVertex::CommonDenominator {
+                denominator,
+                numerators,
+            } => {
+                assert_eq!(denominator, "3");
+                assert_eq!(numerators, &["1", "-2"]);
+            }
+            other => panic!("expected a common-denominator vertex, got {other:?}"),
+        }
+
+        let (items, labels) = build_items(records).unwrap();
+        assert_eq!(items.len(), 2);
+        assert_eq!(labels.len(), 2);
+        assert_eq!(items[0].vertex.den, "3");
+        assert_eq!(items[0].vertex.num, ["1", "-2"]);
+        assert_eq!(items[1].vertex.den, "5");
+        assert_eq!(items[1].vertex.num, ["6", "7"]);
+    }
+}
+
 fn clear_rationals_to_integer_row(values: &[String]) -> Result<Vec<String>> {
-    let mut nums = Vec::<BigInt>::with_capacity(values.len());
-    let mut dens = Vec::<BigInt>::with_capacity(values.len());
+    let mut nums = Vec::<Integer>::with_capacity(values.len());
+    let mut dens = Vec::<Integer>::with_capacity(values.len());
 
     for s in values {
         let (num, den) = parse_rational_parts(s)
@@ -1335,12 +1415,18 @@ fn clear_rationals_to_integer_row(values: &[String]) -> Result<Vec<String>> {
         dens.push(den);
     }
 
-    let lcm = dens.iter().fold(BigInt::one(), |acc, den| acc.lcm(den));
+    let lcm = dens
+        .iter()
+        .fold(Integer::from(1), |acc, den| acc.lcm_ref(den).complete());
 
     Ok(nums
         .iter()
         .zip(&dens)
-        .map(|(num, den)| (num * (&lcm / den)).to_string())
+        .map(|(num, den)| {
+            let mut value = num.clone();
+            value *= (&lcm / den).complete();
+            value.to_string()
+        })
         .collect())
 }
 
@@ -1367,27 +1453,4 @@ pub fn certificate_inequalities(h: &HRep) -> Result<Vec<Inequality>> {
                 .with_context(|| format!("failed to clear denominators of inequality {i}"))
         })
         .collect()
-}
-
-pub fn to_certificate(h: &HRep, items: Vec<VertexItem>, graph: SimplexGraph, root: Root) -> Result<Certificate> {
-    let inequalities = certificate_inequalities(h)?;
-    let (neighbors, geom_edge_lifts) =
-        build_item_neighbors_and_lifts(&graph, items.len())?;
-    let root_owner = graph
-        .lbl
-        .get(root.simplex_id)
-        .ok_or_else(|| anyhow!("root simplex id {} is out of bounds", root.simplex_id))?
-        .owner;
-    let full_dim = build_full_dim_certificate(&items, &neighbors, root_owner, h.d)?;
-    Ok(Certificate {
-        n_inequalities: h.a.len(),
-        dimension: h.d,
-        inequalities,
-        items,
-        graph,
-        neighbors,
-        geom_edge_lifts,
-        full_dim,
-        root,
-    })
 }

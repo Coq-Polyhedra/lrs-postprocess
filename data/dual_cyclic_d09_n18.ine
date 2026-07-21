@@ -26,6 +26,7 @@ begin
 9 81 -444 6561 -43716 531441 -3804564 43046721 -319689156 3486784401
 end
 allbases
+commondenom
 incidence
 printcobasis 1
 threads 0

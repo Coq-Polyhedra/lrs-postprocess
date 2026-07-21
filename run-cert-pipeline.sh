@@ -14,8 +14,8 @@ TIME_CMD="${TIME_CMD:-/usr/bin/time}"
 # is not included in the measured time.
 BIN="${BIN:-./target/release/lrs-postprocess}"
 
-CERT_GEN="${CERT_GEN:-$BIN postprocess --pretty}"
-BIN_CERT_GEN="${BIN_CERT_GEN:-$BIN postprocess --bin}"
+JSON_CERT_GEN="${JSON_CERT_GEN:-$BIN postprocess --pretty}"
+CERT_GEN="${CERT_GEN:-${BIN_CERT_GEN:-$BIN postprocess --bin}}"
 CHECKER="${CHECKER:-$BIN check}"
 
 COQC="${COQC:-coqc}"
@@ -290,11 +290,11 @@ generate_certificate() {
     fi
 
     if [[ -z "$lrs_elapsed" ]]; then
-        echo "warning: missing lrs time for $base; run '$0 ext $base' first for ratios" >&2
+        echo "warning: missing lrs time for $base; run '$0 lrs $base' first for ratios" >&2
     fi
 
     run_timed_stdout_to_file "generate certificate for $base" "$cert_file" "$log_file" "$lrs_elapsed" \
-        $CERT_GEN \
+        $JSON_CERT_GEN \
         "$ine_file" \
         "$ext_file"
 }
@@ -321,11 +321,11 @@ generate_binary_certificate() {
     fi
 
     if [[ -z "$lrs_elapsed" ]]; then
-        echo "warning: missing lrs time for $base; run '$0 ext $base' first for ratios" >&2
+        echo "warning: missing lrs time for $base; run '$0 lrs $base' first for ratios" >&2
     fi
 
     run_stdout_to_file "create, check, and encode certificate for $base" "$bin_file" "$log_file" \
-        $BIN_CERT_GEN \
+        $CERT_GEN \
         "$ine_file" \
         "$ext_file"
 
@@ -425,7 +425,7 @@ run_checker() {
     fi
 
     if [[ -z "$lrs_elapsed" ]]; then
-        echo "warning: missing lrs time for $base; run '$0 ext $base' first for ratios" >&2
+        echo "warning: missing lrs time for $base; run '$0 lrs $base' first for ratios" >&2
     fi
 
     run_timed "check certificate for $base" "$log_file" "$lrs_elapsed" \
@@ -497,7 +497,7 @@ run_coq_binreader_test() {
 
     if [[ ! -f "$bin_file" ]]; then
         echo "error: binary certificate not found: $bin_file" >&2
-        echo "hint: generate it with: $0 bin $base" >&2
+        echo "hint: generate it with: $0 cert $base" >&2
         exit 1
     fi
 
@@ -507,7 +507,7 @@ run_coq_binreader_test() {
     fi
 
     if [[ -z "$lrs_elapsed" ]]; then
-        echo "warning: missing lrs time for $base; run '$0 ext $base' first for ratios" >&2
+        echo "warning: missing lrs time for $base; run '$0 lrs $base' first for ratios" >&2
     fi
 
     mkdir -p "$COQ_DIR"
@@ -561,16 +561,16 @@ run_one() {
     local base="$2"
 
     case "$cmd" in
-        ext)
+        lrs|ext)
             compute_ext "$base"
             ;;
-        cert)
+        json)
             generate_certificate "$base"
             ;;
-        bin)
+        cert|bin)
             generate_binary_certificate "$base"
             ;;
-        check)
+        check-json|check)
             run_checker "$base"
             ;;
         compare-io)
@@ -581,10 +581,10 @@ run_one() {
             run_checker "$base"
             report_json_io_comparison "$base"
             ;;
-        coq)
+        rocq|coq)
             run_coq_binreader_test "$base"
             ;;
-        all)
+        run|all)
             compute_ext "$base"
             generate_binary_certificate "$base"
             run_coq_binreader_test "$base"
@@ -602,15 +602,29 @@ run_one() {
 usage() {
     cat <<EOF
 Usage:
+  $0 BASE[.ine] [BASE[.ine] ...]
+  $0 run    BASE[.ine] [BASE[.ine] ...]
   $0 build
-  $0 ext    BASE [BASE ...]
-  $0 cert   BASE [BASE ...]
-  $0 bin    BASE [BASE ...]
-  $0 check  BASE [BASE ...]
-  $0 compare-io BASE [BASE ...]
-  $0 coq    BASE [BASE ...]
-  $0 all    BASE [BASE ...]
-  $0 clean  BASE [BASE ...]
+  $0 lrs    BASE[.ine] [BASE[.ine] ...]
+  $0 cert   BASE[.ine] [BASE[.ine] ...]
+  $0 rocq   BASE[.ine] [BASE[.ine] ...]
+  $0 clean  BASE[.ine] [BASE[.ine] ...]
+
+The default command is 'run'. It executes the complete production pipeline:
+  lrs -> create certificate -> Rust check -> binary encoding -> Rocq check
+
+Individual production stages:
+  lrs     Generate BASE.ext with lrsgmp.
+  cert    From an existing BASE.ext, create and Rust-check BASE-cert.bin.
+  rocq    Check an existing BASE-cert.bin with Rocq.
+
+JSON diagnostics (not needed by the production pipeline):
+  $0 json         BASE[.ine] [BASE[.ine] ...]
+  $0 check-json   BASE[.ine] [BASE[.ine] ...]
+  $0 compare-io   BASE[.ine] [BASE[.ine] ...]
+
+Compatibility aliases:
+  all = run, ext = lrs, bin = cert, coq = rocq, check = check-json
 
 For each BASE, the script uses:
   ${DATA_DIR}/BASE.ine
@@ -632,13 +646,13 @@ Generated Coq files:
 
 Examples:
   $0 build
-  $0 all cross_9 cross_10 cross_11 cross_12
-  $0 ext cross_9
+  $0 cross_9 cross_10 cross_11 cross_12
+  $0 lrs cross_9.ine
   $0 cert cross_9 cross_10
-  $0 bin cross_9
-  $0 check cross_12
+  $0 rocq cross_9
+  $0 json cross_12
+  $0 check-json cross_12
   $0 compare-io cross_12
-  $0 coq cross_9
   $0 clean cross_9 cross_10
 
 Timing:
@@ -649,7 +663,7 @@ Timing:
   The reference is stored in ${DATA_DIR}/BASE-lrs.time.
   The compare-io command reports the JSON round-trip cost relative to
   preparing the checker input directly from the generated certificate.
-  The all command uses the production path and does not generate JSON:
+  The run command uses the production path and does not generate JSON:
   lrs -> in-memory Rust check -> binary encoding -> Rocq check.
 
 Environment variables:
@@ -658,8 +672,9 @@ Environment variables:
   LRSGMP         full path to lrsgmp
   TIME_CMD       GNU time-compatible command, default: /usr/bin/time
   BIN            compiled Rust binary, default: ./target/release/lrs-postprocess
-  CERT_GEN       JSON certificate command, default: "\$BIN postprocess --pretty"
-  BIN_CERT_GEN   binary certificate command, default: "\$BIN postprocess --bin"
+  CERT_GEN       binary certificate command, default: "\$BIN postprocess --bin"
+  JSON_CERT_GEN  diagnostic JSON command, default: "\$BIN postprocess --pretty"
+  BIN_CERT_GEN   deprecated fallback name for CERT_GEN
   CHECKER        checker command, default: "\$BIN check"
   COQC           Coq compiler, default: coqc
   COQ_TEMPLATE   Coq template, default: coq/InspectCertificate.v.template
@@ -688,14 +703,15 @@ case "$cmd" in
         fi
         build_tools
         ;;
-    ext|cert|bin|check|compare-io|coq|all|clean)
+    run|all|lrs|ext|cert|bin|rocq|coq|json|check-json|check|compare-io|clean)
         if [[ $# -lt 1 ]]; then
             echo "error: expected at least one basename" >&2
             usage
             exit 1
         fi
 
-        for base in "$@"; do
+        for base_arg in "$@"; do
+            base="${base_arg%.ine}"
             echo
             echo "########################################"
             echo "# Processing $base"
@@ -704,8 +720,16 @@ case "$cmd" in
         done
         ;;
     *)
-        echo "error: unknown command: $cmd" >&2
-        usage
-        exit 1
+        # With no explicit command, treat every argument as an input basename
+        # and run the complete production pipeline.
+        set -- "$cmd" "$@"
+        for base_arg in "$@"; do
+            base="${base_arg%.ine}"
+            echo
+            echo "########################################"
+            echo "# Processing $base"
+            echo "########################################"
+            run_one run "$base"
+        done
         ;;
 esac

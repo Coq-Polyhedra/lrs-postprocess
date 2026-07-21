@@ -514,6 +514,7 @@ begin
 9 -1 0 0 0 0 0 0 0
 end
 allbases
+commondenom
 facetneighbors
 incidence
 printcobasis 1

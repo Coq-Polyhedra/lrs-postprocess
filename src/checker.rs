@@ -1,7 +1,5 @@
 use anyhow::{anyhow, Context, Result};
-use num_bigint::{BigInt, Sign};
-use num_integer::Integer;
-use num_traits::{One, Signed, Zero};
+use rug::{Complete, Integer};
 use std::collections::VecDeque;
 use std::time::Instant;
 
@@ -14,27 +12,30 @@ use crate::postprocess::{parse_lrs_hrep, HRep};
 
 // Parsing below is only for the external .ine file. All integers contained in
 // the certificate are parsed by read_parsed_certificate.
-fn parse_hrep_bigint(s: &str) -> Option<BigInt> {
-    BigInt::parse_bytes(s.trim().as_bytes(), 10)
+fn parse_hrep_integer(s: &str) -> Option<Integer> {
+    Integer::parse(s.trim()).ok().map(Integer::from)
 }
 
 fn has_matrix_shape<T>(matrix: &[Vec<T>], rows: usize, columns: usize) -> bool {
     matrix.len() == rows && matrix.iter().all(|row| row.len() == columns)
 }
 
-fn dot(x: &[BigInt], y: &[BigInt]) -> Option<BigInt> {
+fn dot(x: &[Integer], y: &[Integer]) -> Option<Integer> {
     if x.len() != y.len() {
         return None;
     }
-    Some(
-        x.iter()
-            .zip(y)
-            .fold(BigInt::zero(), |acc, (xi, yi)| acc + xi * yi),
-    )
+    let mut result = Integer::new();
+    for (xi, yi) in x.iter().zip(y) {
+        // `xi * yi` is a rug incomplete computation. AddAssign consumes it
+        // through GMP's fused add-multiply path without allocating an
+        // intermediate Integer for the product.
+        result += xi * yi;
+    }
+    Some(result)
 }
 
-fn sparse_dot(weight: &[(usize, BigInt)], x: &[BigInt]) -> Option<BigInt> {
-    let mut result = BigInt::zero();
+fn sparse_dot(weight: &[(usize, Integer)], x: &[Integer]) -> Option<Integer> {
+    let mut result = Integer::new();
     for (i, value) in weight {
         result += value * x.get(*i)?;
     }
@@ -90,45 +91,49 @@ fn is_undirected(graph: &[Vec<usize>]) -> bool {
     })
 }
 
-fn parse_rational_parts(s: &str) -> Option<(BigInt, BigInt)> {
+fn parse_rational_parts(s: &str) -> Option<(Integer, Integer)> {
     let s = s.trim();
     let (mut numerator, mut denominator) = if let Some((a, b)) = s.split_once('/') {
-        (parse_hrep_bigint(a)?, parse_hrep_bigint(b)?)
+        (parse_hrep_integer(a)?, parse_hrep_integer(b)?)
     } else {
-        (parse_hrep_bigint(s)?, BigInt::one())
+        (parse_hrep_integer(s)?, Integer::from(1))
     };
 
-    if denominator.is_zero() {
+    if denominator == 0 {
         return None;
     }
-    if denominator.sign() == Sign::Minus {
+    if denominator < 0 {
         numerator = -numerator;
         denominator = -denominator;
     }
 
-    let gcd = numerator.abs().gcd(&denominator);
-    Some((numerator / &gcd, denominator / gcd))
+    let gcd = numerator.as_abs().gcd_ref(&denominator).complete();
+    numerator /= &gcd;
+    denominator /= gcd;
+    Some((numerator, denominator))
 }
 
-fn clear_rationals_to_integer_row(values: &[String]) -> Option<Vec<BigInt>> {
+fn clear_rationals_to_integer_row(values: &[String]) -> Option<Vec<Integer>> {
     let parts = values
         .iter()
         .map(|value| parse_rational_parts(value))
         .collect::<Option<Vec<_>>>()?;
-    let lcm = parts
-        .iter()
-        .fold(BigInt::one(), |acc, (_, denominator)| {
-            acc.lcm(denominator)
-        });
+    let lcm = parts.iter().fold(Integer::from(1), |acc, (_, denominator)| {
+        acc.lcm_ref(denominator).complete()
+    });
     Some(
         parts
             .into_iter()
-            .map(|(numerator, denominator)| numerator * (&lcm / denominator))
+            .map(|(mut numerator, denominator)| {
+                let scale = &lcm / denominator;
+                numerator *= scale;
+                numerator
+            })
             .collect(),
     )
 }
 
-fn integer_inequality_from_hrep(h: &HRep, i: usize) -> Option<(Vec<BigInt>, BigInt)> {
+fn integer_inequality_from_hrep(h: &HRep, i: usize) -> Option<(Vec<Integer>, Integer)> {
     let mut values = h.a.get(i)?.iter().map(q_to_string).collect::<Vec<_>>();
     values.push(q_to_string(h.b.get(i)?));
     let cleared = clear_rationals_to_integer_row(&values)?;
@@ -161,13 +166,13 @@ mod rocq {
         cert.inequalities.len() == cert.n_inequalities
             && cert.inequalities.iter().all(|inequality| {
                 inequality.a.len() == cert.dimension
-                    && inequality.a.iter().any(|x| !x.is_zero())
+                    && inequality.a.iter().any(|x| x != &0)
             })
     }
 
     pub fn arePointsWellFormed(cert: &Certificate) -> bool {
         cert.items.iter().all(|item| {
-            item.vertex.den > BigInt::zero() && item.vertex.num.len() == cert.dimension
+            item.vertex.den > 0 && item.vertex.num.len() == cert.dimension
         })
     }
 
@@ -279,7 +284,7 @@ mod rocq {
     }
 
     pub fn isFullDimPointWellFormed(cert: &Certificate) -> bool {
-        cert.full_dim.denominator > BigInt::zero()
+        cert.full_dim.denominator > 0
             && cert.full_dim.point.len() == cert.dimension
     }
 
@@ -352,10 +357,10 @@ mod rocq {
         )
     }
 
-    pub fn isSparseVectorWellFormed(dimension: usize, weight: &[(usize, BigInt)]) -> bool {
+    pub fn isSparseVectorWellFormed(dimension: usize, weight: &[(usize, Integer)]) -> bool {
         weight
             .iter()
-            .all(|(i, value)| *i < dimension && !value.is_zero())
+            .all(|(i, value)| *i < dimension && value != &0)
             && weight.windows(2).all(|w| w[0].0 < w[1].0)
     }
 
@@ -404,8 +409,8 @@ mod rocq {
     pub fn check_ineqs(
         inequalities: &[ParsedInequality],
         active_set: &[usize],
-        numerators: &[BigInt],
-        denominator: &BigInt,
+        numerators: &[Integer],
+        denominator: &Integer,
     ) -> bool {
         let mut active_position = 0;
 
@@ -413,7 +418,7 @@ mod rocq {
             let Some(lhs) = dot(&inequality.a, numerators) else {
                 return false;
             };
-            let rhs = &inequality.b * denominator;
+            let rhs = (&inequality.b * denominator).complete();
 
             if active_set.get(active_position) == Some(&i) {
                 if lhs != rhs {
@@ -534,19 +539,19 @@ mod rocq {
                 };
                 (0..cert.dimension).all(|j| {
                     if i == j {
-                        product_row[j] > BigInt::zero()
+                        product_row[j] > 0
                     } else {
-                        product_row[j].is_zero()
+                        product_row[j] == 0
                     }
                 })
             })
     }
 
-    pub fn isSparseVectorPositive(weight: &[(usize, BigInt)]) -> bool {
+    pub fn isSparseVectorPositive(weight: &[(usize, Integer)]) -> bool {
         !weight.is_empty()
             && weight
                 .iter()
-                .all(|(_, value)| value >= &BigInt::zero())
+                .all(|(_, value)| value >= &0)
     }
 
     pub fn separability_check(cert: &Certificate) -> bool {
@@ -589,7 +594,7 @@ mod rocq {
                             };
                             cert.root.m_matrix.get(active_position).is_some_and(|product_row| {
                                 sparse_dot(weight, product_row)
-                                    .is_some_and(|value| value <= BigInt::zero())
+                                    .is_some_and(|value| value <= 0)
                             })
                         })
                 })
@@ -722,11 +727,14 @@ mod rocq {
             let Some(base) = dot(&inequality.a, &cert.full_dim.point) else {
                 return false;
             };
-            let rhs = &inequality.b * &cert.full_dim.denominator;
+            let rhs = (&inequality.b * &cert.full_dim.denominator).complete();
             base <= rhs
                 && cert.full_dim.directions.iter().all(|direction| {
-                    dot(&inequality.a, direction)
-                        .is_some_and(|increment| &base + increment <= rhs)
+                    dot(&inequality.a, direction).is_some_and(|increment| {
+                        let mut value = base.clone();
+                        value += increment;
+                        value <= rhs
+                    })
                 })
         })
     }
@@ -755,9 +763,9 @@ mod rocq {
                 )
                 .is_some_and(|value| {
                     if i == j {
-                        !value.is_zero()
+                        value != 0
                     } else {
-                        value.is_zero()
+                        value == 0
                     }
                 })
             })
@@ -796,17 +804,6 @@ mod rocq {
             && connectivity_check(cert)
     }
 
-    // This follows the literal Rocq definition. As in the Rocq benchmark,
-    // full_dim_check is evaluated separately by the file-level entry point.
-    pub fn check_certificate(cert: &Certificate) -> bool {
-        well_formedness_check(cert)
-            && uniqueness_check(cert)
-            && feasibility_check(cert)
-            && graph_check(cert)
-            && mapping_check(cert)
-            && root_check(cert)
-            && geom_graph_check(cert)
-    }
 }
 
 fn timed_bool(name: &str, check: impl FnOnce() -> bool) -> bool {
@@ -871,4 +868,24 @@ pub fn check_certificate(ine_path: &str, certificate_path: &str) -> Result<()> {
     eprintln!("Read certificate: {:.6} s", start.elapsed().as_secs_f64());
 
     check_parsed_certificate(&h, &cert)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rug_dot_is_exact_for_large_signed_values() {
+        let large = Integer::from(1) << 200;
+        let x = vec![large.clone(), -large.clone(), Integer::from(7)];
+        let y = vec![Integer::from(3), Integer::from(5), Integer::from(-11)];
+        let mut expected = -(large << 1);
+        expected -= 77;
+        assert_eq!(dot(&x, &y), Some(expected));
+    }
+
+    #[test]
+    fn rug_dot_rejects_different_lengths() {
+        assert_eq!(dot(&[Integer::from(1)], &[]), None);
+    }
 }

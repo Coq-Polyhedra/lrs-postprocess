@@ -261,6 +261,7 @@ begin
 end
 
 allbases
+commondenom
 facetneighbors
 incidence
 printcobasis 1

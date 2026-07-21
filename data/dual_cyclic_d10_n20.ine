@@ -28,6 +28,7 @@ begin
 10 100 -615 10000 -74667 1000000 -8021595 100000000 -832268667 10000000000 -85085658075
 end
 allbases
+commondenom
 incidence
 printcobasis 1
 threads 0

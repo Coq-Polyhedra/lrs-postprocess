@@ -37,6 +37,7 @@ begin
 end
 
 allbases
+commondenom
 incidence
 printcobasis 1
 threads 0

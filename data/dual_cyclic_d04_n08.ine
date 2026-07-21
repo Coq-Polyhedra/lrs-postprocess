@@ -16,6 +16,7 @@ begin
 4 16 -34 256 -670
 end
 allbases
+commondenom
 incidence
 printcobasis 1
 threads 0

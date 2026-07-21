@@ -1,5 +1,5 @@
 use anyhow::{anyhow, Context, Result};
-use num_bigint::BigInt;
+use rug::Integer;
 use serde::{Deserialize, Deserializer, Serialize};
 use std::fs;
 
@@ -142,7 +142,8 @@ pub struct Root {
 /// Fully parsed representation used by the checker.
 ///
 /// The JSON/wire representation above deliberately keeps decimal integers as
-/// strings. This representation converts every such string to `BigInt` once,
+/// strings. This representation converts every such string to GMP-backed
+/// `rug::Integer` values once,
 /// as part of JSON deserialization.
 #[derive(Debug, Clone, Deserialize)]
 pub struct ParsedCertificate {
@@ -160,17 +161,17 @@ pub struct ParsedCertificate {
 #[derive(Debug, Clone, Deserialize)]
 pub struct ParsedInequality {
     #[serde(deserialize_with = "deserialize_decimal_vec")]
-    pub a: Vec<BigInt>,
+    pub a: Vec<Integer>,
     #[serde(deserialize_with = "deserialize_decimal")]
-    pub b: BigInt,
+    pub b: Integer,
 }
 
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
 pub struct ParsedVertexCoords {
     #[serde(deserialize_with = "deserialize_decimal_vec")]
-    pub num: Vec<BigInt>,
+    pub num: Vec<Integer>,
     #[serde(deserialize_with = "deserialize_decimal")]
-    pub den: BigInt,
+    pub den: Integer,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -194,13 +195,13 @@ pub struct ParsedSimplexGraph {
 #[derive(Debug, Clone, Deserialize)]
 pub struct ParsedFullDimCertificate {
     #[serde(deserialize_with = "deserialize_decimal")]
-    pub denominator: BigInt,
+    pub denominator: Integer,
     #[serde(deserialize_with = "deserialize_decimal_vec")]
-    pub point: Vec<BigInt>,
+    pub point: Vec<Integer>,
     #[serde(deserialize_with = "deserialize_decimal_matrix")]
-    pub directions: Vec<Vec<BigInt>>,
+    pub directions: Vec<Vec<Integer>>,
     #[serde(deserialize_with = "deserialize_decimal_matrix")]
-    pub left_inverse: Vec<Vec<BigInt>>,
+    pub left_inverse: Vec<Vec<Integer>>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -208,38 +209,40 @@ pub struct ParsedRoot {
     pub simplex_id: usize,
     pub inverse_incident_map: Vec<usize>,
     #[serde(deserialize_with = "deserialize_decimal_matrix")]
-    pub basis_vectors: Vec<Vec<BigInt>>,
+    pub basis_vectors: Vec<Vec<Integer>>,
     #[serde(deserialize_with = "deserialize_decimal_matrix")]
-    pub m_matrix: Vec<Vec<BigInt>>,
+    pub m_matrix: Vec<Vec<Integer>>,
     #[serde(deserialize_with = "deserialize_sparse_decimal_vectors")]
-    pub q_vectors: Vec<Vec<(usize, BigInt)>>,
+    pub q_vectors: Vec<Vec<(usize, Integer)>>,
 }
 
-fn parse_decimal<E: serde::de::Error>(value: &str) -> std::result::Result<BigInt, E> {
-    BigInt::parse_bytes(value.trim().as_bytes(), 10)
-        .ok_or_else(|| E::custom("invalid decimal integer"))
+fn parse_decimal<E: serde::de::Error>(value: &str) -> std::result::Result<Integer, E> {
+    Integer::parse(value.trim())
+        .map(Integer::from)
+        .map_err(|_| E::custom("invalid decimal integer"))
 }
 
-fn parse_decimal_checked(value: &str) -> Result<BigInt> {
-    BigInt::parse_bytes(value.trim().as_bytes(), 10)
-        .ok_or_else(|| anyhow!("invalid decimal integer"))
+fn parse_decimal_checked(value: &str) -> Result<Integer> {
+    Integer::parse(value.trim())
+        .map(Integer::from)
+        .map_err(|_| anyhow!("invalid decimal integer"))
 }
 
-fn parse_decimal_vec_checked(values: &[String]) -> Result<Vec<BigInt>> {
+fn parse_decimal_vec_checked(values: &[String]) -> Result<Vec<Integer>> {
     values
         .iter()
         .map(|value| parse_decimal_checked(value))
         .collect()
 }
 
-fn parse_decimal_matrix_checked(values: &[Vec<String>]) -> Result<Vec<Vec<BigInt>>> {
+fn parse_decimal_matrix_checked(values: &[Vec<String>]) -> Result<Vec<Vec<Integer>>> {
     values
         .iter()
         .map(|row| parse_decimal_vec_checked(row))
         .collect()
 }
 
-fn deserialize_decimal<'de, D>(deserializer: D) -> std::result::Result<BigInt, D::Error>
+fn deserialize_decimal<'de, D>(deserializer: D) -> std::result::Result<Integer, D::Error>
 where
     D: Deserializer<'de>,
 {
@@ -248,7 +251,7 @@ where
 
 fn deserialize_decimal_vec<'de, D>(
     deserializer: D,
-) -> std::result::Result<Vec<BigInt>, D::Error>
+) -> std::result::Result<Vec<Integer>, D::Error>
 where
     D: Deserializer<'de>,
 {
@@ -260,7 +263,7 @@ where
 
 fn deserialize_decimal_matrix<'de, D>(
     deserializer: D,
-) -> std::result::Result<Vec<Vec<BigInt>>, D::Error>
+) -> std::result::Result<Vec<Vec<Integer>>, D::Error>
 where
     D: Deserializer<'de>,
 {
@@ -276,7 +279,7 @@ where
 
 fn deserialize_sparse_decimal_vectors<'de, D>(
     deserializer: D,
-) -> std::result::Result<Vec<Vec<(usize, BigInt)>>, D::Error>
+) -> std::result::Result<Vec<Vec<(usize, Integer)>>, D::Error>
 where
     D: Deserializer<'de>,
 {
@@ -370,20 +373,6 @@ pub fn parse_generated_certificate(raw: &Certificate) -> Result<ParsedCertificat
         full_dim,
         root,
     })
-}
-
-pub fn write_certificate(path: &str, cert: &Certificate, pretty: bool) -> Result<()> {
-    let text = certificate_to_string(cert, pretty)?;
-    fs::write(path, text).with_context(|| format!("failed to write certificate `{path}`"))?;
-    Ok(())
-}
-
-pub fn read_certificate(path: &str) -> Result<Certificate> {
-    let text =
-        fs::read_to_string(path).with_context(|| format!("failed to read certificate `{path}`"))?;
-
-    serde_json::from_str(&text)
-        .with_context(|| format!("failed to parse certificate JSON `{path}`"))
 }
 
 /// Reads the JSON certificate and parses all decimal integers exactly once.
