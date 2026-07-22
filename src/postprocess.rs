@@ -1,8 +1,9 @@
 use anyhow::{anyhow, bail, Context, Result};
 use rug::{Complete, Integer};
 use std::collections::{hash_map::Entry, BTreeMap, HashMap};
-use std::fs;
+use std::fs::{self, File};
 use std::hash::{BuildHasherDefault, Hasher};
+use std::io::{BufRead, BufReader};
 
 use crate::certificate::{FullDimCertificate, GraphLabel, Inequality, Root, SimplexGraph, VertexCoords, VertexItem};
 use crate::numerics::{invert_matrix, parse_q, q_to_string, Q};
@@ -14,32 +15,6 @@ pub struct HRep {
     pub b: Vec<Q>,
     pub d: usize,
 }
-
-#[derive(Debug, Clone)]
-pub struct LrsRecord {
-    pub vertex: LrsVertex,
-
-    /// Cobasis facets before `:` in the lrs incidence/cobasis line.
-    /// Converted to 0-based row indices.
-    pub cobasis: Vec<usize>,
-
-    /// Additional incident inequalities after `:`.
-    /// Converted to 0-based row indices.
-    pub additional_incident: Vec<usize>,
-}
-
-#[derive(Debug, Clone)]
-pub enum LrsVertex {
-    /// Ordinary lrs row, without its leading homogeneous coordinate.
-    Coordinates(Vec<String>),
-
-    /// Primitive common-denominator row emitted by the `commondenom` option.
-    CommonDenominator {
-        denominator: String,
-        numerators: Vec<String>,
-    },
-}
-
 
 fn parse_rational_parts(s: &str) -> Result<(Integer, Integer)> {
     let value = parse_q(s)?;
@@ -78,8 +53,8 @@ fn vertex_coords_from_strings(v: &[String]) -> Result<VertexCoords> {
 }
 
 fn vertex_coords_from_common_denominator(
-    denominator: String,
-    numerators: Vec<String>,
+    denominator: &str,
+    numerators: &[&str],
 ) -> Result<VertexCoords> {
     let denominator = Integer::parse(denominator.trim())
         .ok()
@@ -91,7 +66,7 @@ fn vertex_coords_from_common_denominator(
     }
 
     let numerators = numerators
-        .into_iter()
+        .iter()
         .enumerate()
         .map(|(j, numerator)| {
             Integer::parse(numerator.trim())
@@ -244,7 +219,8 @@ fn is_vertex_or_ray_row(line: &str, d: usize) -> bool {
     toks.first() == Some(&"1") || toks.first() == Some(&"0")
 }
 
-/// Parse lrs output produced with H-representation input and:
+/// Parse lrs output produced with H-representation input and directly build
+/// the vertex items and global simplex labels.
 ///
 /// allbases
 /// incidence
@@ -258,18 +234,28 @@ fn is_vertex_or_ray_row(line: &str, d: usize) -> bool {
 /// - 12 14 15 16 are the cobasis facets and define a simplex.
 /// - 9 10 11 13 are additional incident inequalities.
 /// - all are converted from 1-based to 0-based.
-pub fn parse_lrs_ext_records(path: &str, d: usize, m_ineq: usize) -> Result<Vec<LrsRecord>> {
-    let text = fs::read_to_string(path)?;
-    let lines: Vec<&str> = text.lines().collect();
+///
+/// This is deliberately a streaming operation.  In particular, it does not
+/// retain the `.ext` text or a record containing the (usually very large)
+/// complete incidence list for every basis.  Only the d-element simplex and a
+/// provisional owner id survive each iteration.
+pub fn parse_lrs_ext_items(
+    path: &str,
+    d: usize,
+    m_ineq: usize,
+) -> Result<(Vec<VertexItem>, Vec<GraphLabel>)> {
+    let file = File::open(path).with_context(|| format!("failed to open `{path}`"))?;
+    let mut lines = BufReader::new(file).lines();
 
-    let mut records = Vec::new();
-    let mut i = 0;
+    let mut items = Vec::<VertexItem>::new();
+    let mut incident_to_id = BTreeMap::<Vec<usize>, usize>::new();
+    let mut labels = Vec::<GraphLabel>::new();
 
-    while i < lines.len() {
-        let line = lines[i].trim();
+    while let Some(line) = lines.next() {
+        let line = line?;
+        let line = line.trim();
 
         if !(line.starts_with("V#") && line.contains(" facets ")) {
-            i += 1;
             continue;
         }
 
@@ -338,16 +324,21 @@ pub fn parse_lrs_ext_records(path: &str, d: usize, m_ineq: usize) -> Result<Vec<
                 line
             );
         }
+        cobasis.sort_unstable();
+        if cobasis.windows(2).any(|pair| pair[0] == pair[1]) {
+            bail!("cobasis contains duplicate row indices: {cobasis:?}");
+        }
 
-        // Pair this cobasis/incidence line with the next output row.  A
+        // Pair this cobasis/incidence line with the next output row. A
         // `*vertexcommon` line is data, despite using lrs's usual comment
         // prefix, so recognize it before skipping other `*` lines.
-        i += 1;
-
-        while i < lines.len() {
-            let vline = lines[i].trim();
-
-            let vtoks: Vec<&str> = vline.split_whitespace().collect();
+        let (vline, common_denominator) = loop {
+            let vline = lines
+                .next()
+                .transpose()?
+                .with_context(|| format!("missing vertex/ray row after `{line}`"))?;
+            let trimmed = vline.trim();
+            let vtoks = trimmed.split_whitespace().collect::<Vec<_>>();
 
             if vtoks.first() == Some(&"*vertexcommon") {
                 if vtoks.len() != d + 2 {
@@ -355,140 +346,95 @@ pub fn parse_lrs_ext_records(path: &str, d: usize, m_ineq: usize) -> Result<Vec<
                         "common-denominator vertex row has {} values after its tag, expected {} (denominator plus {d} numerators): `{}`",
                         vtoks.len().saturating_sub(1),
                         d + 1,
-                        vline
+                        trimmed
                     );
                 }
-
-                records.push(LrsRecord {
-                    vertex: LrsVertex::CommonDenominator {
-                        denominator: vtoks[1].to_string(),
-                        numerators: vtoks[2..].iter().map(|s| (*s).to_string()).collect(),
-                    },
-                    cobasis,
-                    additional_incident: additional,
-                });
-
-                i += 1;
-                break;
+                break (vline, true);
             }
 
-            if vline.is_empty()
-                || vline.starts_with('*')
-                || vline.eq_ignore_ascii_case("begin")
-                || vline.eq_ignore_ascii_case("end")
+            if trimmed.is_empty()
+                || trimmed.starts_with('*')
+                || trimmed.eq_ignore_ascii_case("begin")
+                || trimmed.eq_ignore_ascii_case("end")
             {
-                i += 1;
                 continue;
             }
 
-            if !is_vertex_or_ray_row(vline, d) {
+            if !is_vertex_or_ray_row(trimmed, d) {
                 bail!(
                     "expected vertex/ray row immediately after cobasis line, got `{}` after `{}`",
-                    vline,
+                    trimmed,
                     line
                 );
             }
-
-            // Keep only vertices. Ignore rays.
-            if vtoks[0] == "1" {
-                records.push(LrsRecord {
-                    vertex: LrsVertex::Coordinates(
-                        vtoks[1..].iter().map(|s| (*s).to_string()).collect(),
-                    ),
-                    cobasis,
-                    additional_incident: additional,
-                });
-            }
-
-            i += 1;
-            break;
-        }
-    }
-
-    Ok(records)
-}
-
-pub fn build_items(records: Vec<LrsRecord>) -> Result<(Vec<VertexItem>, Vec<GraphLabel>)> {
-    let mut items: Vec<VertexItem> = Vec::new();
-    let mut vertex_to_id: BTreeMap<VertexCoords, usize> = BTreeMap::new();
-    let mut pending_labels: Vec<(Vec<usize>, VertexCoords)> = Vec::new();
-
-    for rec in records {
-        let vertex = match rec.vertex {
-            LrsVertex::Coordinates(coordinates) => vertex_coords_from_strings(&coordinates)?,
-            LrsVertex::CommonDenominator {
-                denominator,
-                numerators,
-            } => vertex_coords_from_common_denominator(denominator, numerators)?,
+            break (vline, false);
         };
 
-        let mut incident = rec.cobasis.clone();
-        incident.extend(rec.additional_incident.iter().copied());
+        let vtoks = vline.split_whitespace().collect::<Vec<_>>();
+        if !common_denominator && vtoks[0] == "0" {
+            continue;
+        }
+
+        let mut incident = cobasis.clone();
+        incident.extend(additional.iter().copied());
         incident = sorted_unique(incident);
 
-        match vertex_to_id.get(&vertex) {
-            Some(&id) => {
-                if items[id].incident != incident {
-                    bail!(
-                        "inconsistent incident list for vertex {:?}: first={:?}, new={:?}",
-                        vertex,
-                        items[id].incident,
-                        incident
-                    );
-                }
-            }
-            None => {
-                let id = items.len();
-                vertex_to_id.insert(vertex.clone(), id);
-                items.push(VertexItem {
-                    incident: incident.clone(),
-                    vertex: vertex.clone(),
-                });
-            }
-        }
+        let owner = if let Some(&id) = incident_to_id.get(&incident) {
+            id
+        } else {
+            let vertex = if common_denominator {
+                vertex_coords_from_common_denominator(vtoks[1], &vtoks[2..])?
+            } else {
+                let coordinates = vtoks[1..]
+                    .iter()
+                    .map(|value| (*value).to_string())
+                    .collect::<Vec<_>>();
+                vertex_coords_from_strings(&coordinates)?
+            };
+            let id = items.len();
+            items.push(VertexItem {
+                incident: incident.clone(),
+                vertex,
+            });
+            incident_to_id.insert(incident, id);
+            id
+        };
 
-        let rows = sorted_unique(rec.cobasis.clone());
-        if rows.len() != rec.cobasis.len() {
-            bail!("cobasis contains duplicate row indices: {:?}", rec.cobasis);
-        }
-
-        // The owner is stored by vertex coordinates for now.  We sort items below,
-        // then convert owners to the final item indices.
-        pending_labels.push((rows, vertex));
+        labels.push(GraphLabel {
+            simplex: cobasis,
+            owner,
+        });
     }
 
     // Canonicalize item ordering for the certificate: items are sorted
     // lexicographically by their incident inequality lists. This makes the
     // Coq-side item array searchable by its first component.
-    items.sort_by(|a, b| a.incident.cmp(&b.incident));
+    let mut indexed_items = items.into_iter().enumerate().collect::<Vec<_>>();
+    indexed_items.sort_unstable_by(|(_, a), (_, b)| a.incident.cmp(&b.incident));
 
-    let mut coord_to_sorted_id = BTreeMap::<VertexCoords, usize>::new();
-    for (id, item) in items.iter().enumerate() {
-        coord_to_sorted_id.insert(item.vertex.clone(), id);
+    let mut old_to_new = vec![usize::MAX; indexed_items.len()];
+    let mut items = Vec::with_capacity(indexed_items.len());
+    for (new_id, (old_id, item)) in indexed_items.into_iter().enumerate() {
+        old_to_new[old_id] = new_id;
+        items.push(item);
     }
 
-    let mut lbl = Vec::<GraphLabel>::with_capacity(pending_labels.len());
-    for (simplex, vertex) in pending_labels {
-        let owner = *coord_to_sorted_id
-            .get(&vertex)
-            .ok_or_else(|| anyhow!("internal error: lost vertex while remapping simplex owners"))?;
-
-        if !sorted_subset(&simplex, &items[owner].incident) {
+    for label in &mut labels {
+        label.owner = old_to_new[label.owner];
+        if !sorted_subset(&label.simplex, &items[label.owner].incident) {
             bail!(
                 "simplex {:?} is not contained in incident list of owner item {}: {:?}",
-                simplex,
-                owner,
-                items[owner].incident
+                label.simplex,
+                label.owner,
+                items[label.owner].incident
             );
         }
-
-        lbl.push(GraphLabel { simplex, owner });
     }
 
     // Canonicalize graph node numbering by lexicographic order of global simplices.
-    lbl.sort_by(|a, b| a.simplex.cmp(&b.simplex).then(a.owner.cmp(&b.owner)));
+    labels.sort_unstable_by(|a, b| a.simplex.cmp(&b.simplex).then(a.owner.cmp(&b.owner)));
 
-    Ok((items, lbl))
+    Ok((items, labels))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -1378,23 +1324,9 @@ V#2 R#0 B#2 h=1 facets  3 4 I#2 det= 1
 ";
         fs::write(&path, ext).unwrap();
 
-        let records = parse_lrs_ext_records(path.to_str().unwrap(), 2, 4).unwrap();
+        let (items, labels) = parse_lrs_ext_items(path.to_str().unwrap(), 2, 4).unwrap();
         let _ = fs::remove_file(&path);
 
-        assert_eq!(records.len(), 2);
-
-        match &records[0].vertex {
-            LrsVertex::CommonDenominator {
-                denominator,
-                numerators,
-            } => {
-                assert_eq!(denominator, "3");
-                assert_eq!(numerators, &["1", "-2"]);
-            }
-            other => panic!("expected a common-denominator vertex, got {other:?}"),
-        }
-
-        let (items, labels) = build_items(records).unwrap();
         assert_eq!(items.len(), 2);
         assert_eq!(labels.len(), 2);
         assert_eq!(items[0].vertex.den, "3");

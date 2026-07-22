@@ -12,9 +12,9 @@ use binencode::write_certificate_bin;
 use certificate::{certificate_to_string, Certificate};
 use checker::{check_certificate, check_generated_certificate};
 use postprocess::{
-    build_full_dim_certificate, build_item_neighbors_and_lifts, build_items,
+    build_full_dim_certificate, build_item_neighbors_and_lifts,
     build_simplex_graph, certificate_inequalities, choose_default_k0,
-    parse_lrs_ext_records, parse_lrs_hrep, root_certificate,
+    parse_lrs_ext_items, parse_lrs_hrep, root_certificate,
 };
 
 #[derive(Debug, Clone)]
@@ -204,31 +204,38 @@ fn parse_args() -> Result<Command> {
 }
 
 fn run_postprocess(args: PostprocessArgs) -> Result<()> {
-    // Time each construction phase without printing between phases, so the
-    // aggregate is not inflated by timing-report I/O.
+    // Report each construction phase immediately. This makes long-running
+    // certificate generation observable while preserving an aggregate timer.
     let certificate_start = Instant::now();
 
     let start = Instant::now();
     let h = parse_lrs_hrep(&args.ine_path).context("failed to parse H-representation")?;
     let read_ine_elapsed = start.elapsed();
+    eprintln!(
+        "Certificate: read and parse .ine file: {:.6} s",
+        read_ine_elapsed.as_secs_f64()
+    );
 
     let start = Instant::now();
-    let records = parse_lrs_ext_records(&args.ext_path, h.d, h.a.len())
+    let (items, labels) = parse_lrs_ext_items(&args.ext_path, h.d, h.a.len())
         .context("failed to parse lrs ext output")?;
     let read_ext_elapsed = start.elapsed();
+    eprintln!(
+        "Certificate: stream .ext and build vertices/facets: {:.6} s",
+        read_ext_elapsed.as_secs_f64()
+    );
 
-    if records.is_empty() {
+    if labels.is_empty() {
         bail!("no vertex/cobasis records found in lrs ext output");
     }
 
     let start = Instant::now();
-    let (items, labels) = build_items(records)
-        .context("failed to build vertex items and global simplices")?;
-    let build_items_elapsed = start.elapsed();
-
-    let start = Instant::now();
     let graph = build_simplex_graph(labels).context("failed to build simplex graph")?;
     let build_graph_elapsed = start.elapsed();
+    eprintln!(
+        "Certificate: build facet graph: {:.6} s",
+        build_graph_elapsed.as_secs_f64()
+    );
 
     let start = Instant::now();
     let k0 = match args.k0 {
@@ -247,20 +254,36 @@ fn run_postprocess(args: PostprocessArgs) -> Result<()> {
         None => choose_default_k0(&items, &graph)?,
     };
     let choose_root_elapsed = start.elapsed();
+    eprintln!(
+        "Certificate: choose root vertex: {:.6} s",
+        choose_root_elapsed.as_secs_f64()
+    );
 
     let start = Instant::now();
     let root = root_certificate(&h, &items, &graph, k0)
         .context("failed to build root certificate")?;
     let root_elapsed = start.elapsed();
+    eprintln!(
+        "Certificate: build root certificate: {:.6} s",
+        root_elapsed.as_secs_f64()
+    );
 
     let start = Instant::now();
     let inequalities = certificate_inequalities(&h)?;
     let inequalities_elapsed = start.elapsed();
+    eprintln!(
+        "Certificate: convert inequalities: {:.6} s",
+        inequalities_elapsed.as_secs_f64()
+    );
 
     let start = Instant::now();
     let (neighbors, geom_edge_lifts) =
         build_item_neighbors_and_lifts(&graph, items.len())?;
     let geom_graph_elapsed = start.elapsed();
+    eprintln!(
+        "Certificate: build geometric graph and lifts: {:.6} s",
+        geom_graph_elapsed.as_secs_f64()
+    );
 
     let start = Instant::now();
     let root_owner = graph
@@ -275,6 +298,10 @@ fn run_postprocess(args: PostprocessArgs) -> Result<()> {
         .owner;
     let full_dim = build_full_dim_certificate(&items, &neighbors, root_owner, h.d)?;
     let full_dim_elapsed = start.elapsed();
+    eprintln!(
+        "Certificate: build full-dimensionality certificate: {:.6} s",
+        full_dim_elapsed.as_secs_f64()
+    );
 
     let start = Instant::now();
     let cert = Certificate {
@@ -289,48 +316,11 @@ fn run_postprocess(args: PostprocessArgs) -> Result<()> {
         root,
     };
     let assemble_elapsed = start.elapsed();
-    let certificate_elapsed = certificate_start.elapsed();
-
-    eprintln!(
-        "Certificate: read and parse .ine file: {:.6} s",
-        read_ine_elapsed.as_secs_f64()
-    );
-    eprintln!(
-        "Certificate: read and parse .ext file: {:.6} s",
-        read_ext_elapsed.as_secs_f64()
-    );
-    eprintln!(
-        "Certificate: build vertices and facets: {:.6} s",
-        build_items_elapsed.as_secs_f64()
-    );
-    eprintln!(
-        "Certificate: build facet graph: {:.6} s",
-        build_graph_elapsed.as_secs_f64()
-    );
-    eprintln!(
-        "Certificate: choose root vertex: {:.6} s",
-        choose_root_elapsed.as_secs_f64()
-    );
-    eprintln!(
-        "Certificate: build root certificate: {:.6} s",
-        root_elapsed.as_secs_f64()
-    );
-    eprintln!(
-        "Certificate: convert inequalities: {:.6} s",
-        inequalities_elapsed.as_secs_f64()
-    );
-    eprintln!(
-        "Certificate: build geometric graph and lifts: {:.6} s",
-        geom_graph_elapsed.as_secs_f64()
-    );
-    eprintln!(
-        "Certificate: build full-dimensionality certificate: {:.6} s",
-        full_dim_elapsed.as_secs_f64()
-    );
     eprintln!(
         "Certificate: assemble value: {:.6} s",
         assemble_elapsed.as_secs_f64()
     );
+    let certificate_elapsed = certificate_start.elapsed();
     eprintln!(
         "Create certificate in memory: {:.6} s",
         certificate_elapsed.as_secs_f64()
