@@ -106,10 +106,6 @@ fn write_bigz<W: Write>(w: &mut W, z: &Integer) -> Result<()> {
     write_bign(w, &abs)
 }
 
-fn parse_integer(s: &str) -> Option<Integer> {
-    Integer::parse(s.trim()).ok().map(Integer::from)
-}
-
 fn write_array<W, T, F>(w: &mut W, elem_descr: &Descr, xs: &[T], mut write_elem: F) -> Result<()>
 where
     W: Write,
@@ -229,9 +225,9 @@ fn write_usize_array<W: Write>(w: &mut W, xs: &[usize]) -> Result<()> {
     write_array(w, &Descr::Int63, xs, |w, x| write_int63_usize(w, *x))
 }
 
-fn write_bigz_string_matrix<W: Write>(w: &mut W, m: &[Vec<String>]) -> Result<()> {
+fn write_bigz_matrix<W: Write>(w: &mut W, m: &[Vec<Integer>]) -> Result<()> {
     let row_descr = array(Descr::BigZ);
-    write_array(w, &row_descr, m, |w, row| write_bigz_string_array(w, row))
+    write_array(w, &row_descr, m, |w, row| write_bigz_array(w, row))
 }
 
 fn write_usize_matrix<W: Write>(w: &mut W, m: &[Vec<usize>]) -> Result<()> {
@@ -241,37 +237,27 @@ fn write_usize_matrix<W: Write>(w: &mut W, m: &[Vec<usize>]) -> Result<()> {
 
 fn write_inequality<W: Write>(w: &mut W, ineq: &Inequality) -> Result<()> {
     // inequality := integer coefficients * integer rhs
-    write_bigz_string_array(w, &ineq.a)?;
-    write_bigz_str(w, &ineq.b)?;
+    write_bigz_array(w, &ineq.a)?;
+    write_bigz(w, &ineq.b)?;
     Ok(())
 }
 
-
-fn write_bigz_str<W: Write>(w: &mut W, s: &str) -> Result<()> {
-    let z = parse_integer(s)
-        .ok_or_else(|| anyhow::anyhow!("invalid integer `{}`", s.trim()))?;
-    write_bigz(w, &z)
-}
-
-fn write_bign_str<W: Write>(w: &mut W, s: &str) -> Result<()> {
-    let n = parse_integer(s)
-        .ok_or_else(|| anyhow::anyhow!("invalid natural integer `{}`", s.trim()))?;
-
-    if n <= 0 {
+fn write_positive_bign<W: Write>(w: &mut W, n: &Integer) -> Result<()> {
+    if n <= &0 {
         bail!("BigN denominator must be positive, got {n}");
     }
 
-    write_bign(w, &n)
+    write_bign(w, n)
 }
 
-fn write_bigz_string_array<W: Write>(w: &mut W, xs: &[String]) -> Result<()> {
-    write_array(w, &Descr::BigZ, xs, |w, x| write_bigz_str(w, x))
+fn write_bigz_array<W: Write>(w: &mut W, xs: &[Integer]) -> Result<()> {
+    write_array(w, &Descr::BigZ, xs, write_bigz)
 }
 
 fn write_vertex_coords<W: Write>(w: &mut W, vertex: &VertexCoords) -> Result<()> {
     // vertex := integer numerators * common positive denominator
-    write_bigz_string_array(w, &vertex.num)?;
-    write_bign_str(w, &vertex.den)?;
+    write_bigz_array(w, &vertex.num)?;
+    write_positive_bign(w, &vertex.den)?;
     Ok(())
 }
 
@@ -299,13 +285,13 @@ fn write_graph<W: Write>(w: &mut W, graph: &SimplexGraph) -> Result<()> {
     Ok(())
 }
 
-fn write_sparse_entry<W: Write>(w: &mut W, entry: &(usize, String)) -> Result<()> {
+fn write_sparse_entry<W: Write>(w: &mut W, entry: &(usize, Integer)) -> Result<()> {
     write_int63_usize(w, entry.0)?;
-    write_bigz_str(w, &entry.1)?;
+    write_bigz(w, &entry.1)?;
     Ok(())
 }
 
-fn write_sparse_vector<W: Write>(w: &mut W, sparse: &[(usize, String)]) -> Result<()> {
+fn write_sparse_vector<W: Write>(w: &mut W, sparse: &[(usize, Integer)]) -> Result<()> {
     let entry_d = sparse_entry_descr();
     write_array(w, &entry_d, sparse, |w, entry| write_sparse_entry(w, entry))
 }
@@ -399,10 +385,10 @@ fn split_geom_edge_lifts(
 
 fn write_full_dim<W: Write>(w: &mut W, full_dim: &FullDimCertificate) -> Result<()> {
     // full_dim := (point * denominator) * (direction_columns * left_inverse)
-    write_bigz_string_array(w, &full_dim.point)?;
-    write_bign_str(w, &full_dim.denominator)?;
-    write_bigz_string_matrix(w, &full_dim.directions)?;
-    write_bigz_string_matrix(w, &full_dim.left_inverse)?;
+    write_bigz_array(w, &full_dim.point)?;
+    write_positive_bign(w, &full_dim.denominator)?;
+    write_bigz_matrix(w, &full_dim.directions)?;
+    write_bigz_matrix(w, &full_dim.left_inverse)?;
     Ok(())
 }
 
@@ -410,8 +396,8 @@ fn write_root<W: Write>(w: &mut W, root: &Root) -> Result<()> {
     // root := simplex_id * (inverse_incident_map * (basis_vectors * (m_matrix * q_vectors)))
     write_int63_usize(w, root.simplex_id)?;
     write_usize_array(w, &root.inverse_incident_map)?;
-    write_bigz_string_matrix(w, &root.basis_vectors)?;
-    write_bigz_string_matrix(w, &root.m_matrix)?;
+    write_bigz_matrix(w, &root.basis_vectors)?;
+    write_bigz_matrix(w, &root.m_matrix)?;
 
     let sparse_d = sparse_vector_descr();
     write_array(w, &sparse_d, &root.q_vectors, |w, sparse| write_sparse_vector(w, sparse))?;

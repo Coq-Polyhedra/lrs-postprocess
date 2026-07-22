@@ -28,14 +28,6 @@ pub fn parse_q(s: &str) -> Result<Q> {
     Ok(Q::from((n, d)))
 }
 
-pub fn q_to_string(x: &Q) -> String {
-    if x.denom() == &1 {
-        x.numer().to_string()
-    } else {
-        format!("{}/{}", x.numer(), x.denom())
-    }
-}
-
 pub fn invert_matrix(a: &[Vec<Q>]) -> Result<Vec<Vec<Q>>> {
     let n = a.len();
 
@@ -99,8 +91,11 @@ mod tests {
 
     #[test]
     fn rational_parsing_is_canonical() {
-        assert_eq!(q_to_string(&parse_q("-6/-8").unwrap()), "3/4");
-        assert_eq!(q_to_string(&parse_q("10/5").unwrap()), "2");
+        assert_eq!(
+            parse_q("-6/-8").unwrap(),
+            Q::from((Integer::from(3), Integer::from(4)))
+        );
+        assert_eq!(parse_q("10/5").unwrap(), Q::from(2));
         assert!(parse_q("1/0").is_err());
     }
 

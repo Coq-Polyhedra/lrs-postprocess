@@ -1,218 +1,90 @@
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result};
 use rug::Integer;
-use serde::{Deserialize, Deserializer, Serialize};
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::fs;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Certificate {
-    /// Explicit number of inequalities.
     pub n_inequalities: usize,
-
-    /// Explicit ambient dimension.
     pub dimension: usize,
-
-    /// Inequalities A x <= b used by the certificate.
     pub inequalities: Vec<Inequality>,
-
-    /// Candidate vertices/items.  The simplices are no longer stored locally
-    /// here: all simplices live globally in `graph.lbl`.
     pub items: Vec<VertexItem>,
-
     pub graph: SimplexGraph,
-
-    /// Candidate edge-neighbors for each item.
-    ///
-    /// `neighbors[v]` is a strictly sorted list of item indices `w`.
-    /// The postprocessor derives it from cross-label ridge adjacencies
-    /// in the simplex graph. The checker verifies symmetry and exact
-    /// agreement with the graph-derived neighbor relation.
     pub neighbors: Vec<Vec<usize>>,
-
-    /// For every directed geometric edge `v -> neighbors[v][j]`, stores
-    /// one oriented simplex-graph edge `(s, t)` with owner(s)=v and
-    /// owner(t)=neighbors[v][j]. This array is positionally parallel to
-    /// `neighbors`.
     pub geom_edge_lifts: Vec<Vec<(usize, usize)>>,
-
-    /// Integer certificate that the polyhedron is full-dimensional.
     pub full_dim: FullDimCertificate,
-
     pub root: Root,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Inequality {
-    /// Integer coefficients of a_i after clearing denominators in this row.
-    pub a: Vec<String>,
+    /// Integer coefficients after clearing denominators in this row.
+    #[serde(with = "decimal_vec")]
+    pub a: Vec<Integer>,
 
-    /// Integer right-hand side b_i after clearing denominators in this row.
-    pub b: String,
+    /// Integer right-hand side after clearing denominators in this row.
+    #[serde(with = "decimal")]
+    pub b: Integer,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
 pub struct VertexCoords {
-    /// Integer numerators after clearing denominators.
-    pub num: Vec<String>,
+    /// Integer numerators over the common denominator.
+    #[serde(with = "decimal_vec")]
+    pub num: Vec<Integer>,
 
     /// Common positive denominator, encoded as BigN in the binary format.
-    pub den: String,
+    #[serde(with = "decimal")]
+    pub den: Integer,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct VertexItem {
-    /// Incident inequality indices.
-    ///
-    /// This field is intentionally first in the binary encoding of items.
-    /// The item array is sorted lexicographically by this list.
     pub incident: Vec<usize>,
-
-    /// Vertex coordinates represented as num / den, componentwise.
     pub vertex: VertexCoords,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GraphLabel {
-    /// Global row indices of the simplex. This list must be sorted and have length d.
     pub simplex: Vec<usize>,
-
-    /// Owner item/vertex of this global simplex.
     pub owner: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SimplexGraph {
-    /// Strictly increasing adjacency lists of facet/simplex graph nodes.
     pub g: Vec<Vec<usize>>,
-
-    /// Labels of graph nodes. Each entry contains the global simplex and its owner item.
     pub lbl: Vec<GraphLabel>,
 }
 
-
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FullDimCertificate {
-    /// Common positive denominator q.
-    pub denominator: String,
+    #[serde(with = "decimal")]
+    pub denominator: Integer,
 
-    /// Integer numerator p of the feasible base point x0 = p / q.
-    pub point: Vec<String>,
+    #[serde(with = "decimal_vec")]
+    pub point: Vec<Integer>,
 
-    /// The d integer direction numerators r^j. Each outer entry is one
-    /// column of R, so directions[j][k] = R_{k,j}.
-    pub directions: Vec<Vec<String>>,
+    /// Columns of the integer direction matrix.
+    #[serde(with = "decimal_matrix")]
+    pub directions: Vec<Vec<Integer>>,
 
-    /// Integer d x d matrix U, stored by rows, such that U R is diagonal
-    /// with nonzero diagonal entries.
-    pub left_inverse: Vec<Vec<String>>,
+    /// Rows of an integer left inverse up to a nonzero diagonal scaling.
+    #[serde(with = "decimal_matrix")]
+    pub left_inverse: Vec<Vec<Integer>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Root {
-    /// Graph-node index of the distinguished root simplex sigma*.
-    pub simplex_id: usize,
-
-    /// Inverse map to the root owner incident list.
-    ///
-    /// This has length `n_inequalities`. If the root owner has incident list I,
-    /// then `inverse_incident_map[i]` is the position of `i` in I when `i in I`,
-    /// and is `n_inequalities` otherwise.
-    pub inverse_incident_map: Vec<usize>,
-
-    /// Integer vectors f_1, ..., f_d.
-    ///
-    /// The outer array is indexed by j, and `basis_vectors[j]` is the
-    /// coordinate vector f_j in the ambient dimension d.
-    pub basis_vectors: Vec<Vec<String>>,
-
-    /// Matrix M indexed by local active-inequality position and basis-vector index.
-    ///
-    /// If sigma* is owned by v and I_v = items[v].incident, then
-    /// `m_matrix[p][j] = a_{I_v[p]}^T f_j`, where the integer row a_i is
-    /// the numerator row stored in `inequalities[i].a`.
-    pub m_matrix: Vec<Vec<String>>,
-
-    /// Sparse nonnegative certificates for same-owner simplices distinct from sigma*.
-    ///
-    /// Entries are listed in graph-label order over labels with the same owner as
-    /// sigma*, excluding sigma* itself. A sparse vector is encoded as sorted pairs
-    /// `(coordinate, positive_integer_value)`.
-    pub q_vectors: Vec<Vec<(usize, String)>>,
-}
-
-/// Fully parsed representation used by the checker.
-///
-/// The JSON/wire representation above deliberately keeps decimal integers as
-/// strings. This representation converts every such string to GMP-backed
-/// `rug::Integer` values once,
-/// as part of JSON deserialization.
-#[derive(Debug, Clone, Deserialize)]
-pub struct ParsedCertificate {
-    pub n_inequalities: usize,
-    pub dimension: usize,
-    pub inequalities: Vec<ParsedInequality>,
-    pub items: Vec<ParsedVertexItem>,
-    pub graph: ParsedSimplexGraph,
-    pub neighbors: Vec<Vec<usize>>,
-    pub geom_edge_lifts: Vec<Vec<(usize, usize)>>,
-    pub full_dim: ParsedFullDimCertificate,
-    pub root: ParsedRoot,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-pub struct ParsedInequality {
-    #[serde(deserialize_with = "deserialize_decimal_vec")]
-    pub a: Vec<Integer>,
-    #[serde(deserialize_with = "deserialize_decimal")]
-    pub b: Integer,
-}
-
-#[derive(Debug, Clone, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
-pub struct ParsedVertexCoords {
-    #[serde(deserialize_with = "deserialize_decimal_vec")]
-    pub num: Vec<Integer>,
-    #[serde(deserialize_with = "deserialize_decimal")]
-    pub den: Integer,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-pub struct ParsedVertexItem {
-    pub incident: Vec<usize>,
-    pub vertex: ParsedVertexCoords,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-pub struct ParsedGraphLabel {
-    pub simplex: Vec<usize>,
-    pub owner: usize,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-pub struct ParsedSimplexGraph {
-    pub g: Vec<Vec<usize>>,
-    pub lbl: Vec<ParsedGraphLabel>,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-pub struct ParsedFullDimCertificate {
-    #[serde(deserialize_with = "deserialize_decimal")]
-    pub denominator: Integer,
-    #[serde(deserialize_with = "deserialize_decimal_vec")]
-    pub point: Vec<Integer>,
-    #[serde(deserialize_with = "deserialize_decimal_matrix")]
-    pub directions: Vec<Vec<Integer>>,
-    #[serde(deserialize_with = "deserialize_decimal_matrix")]
-    pub left_inverse: Vec<Vec<Integer>>,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-pub struct ParsedRoot {
     pub simplex_id: usize,
     pub inverse_incident_map: Vec<usize>,
-    #[serde(deserialize_with = "deserialize_decimal_matrix")]
+
+    #[serde(with = "decimal_matrix")]
     pub basis_vectors: Vec<Vec<Integer>>,
-    #[serde(deserialize_with = "deserialize_decimal_matrix")]
+
+    #[serde(with = "decimal_matrix")]
     pub m_matrix: Vec<Vec<Integer>>,
-    #[serde(deserialize_with = "deserialize_sparse_decimal_vectors")]
+
+    #[serde(with = "sparse_decimal_vectors")]
     pub q_vectors: Vec<Vec<(usize, Integer)>>,
 }
 
@@ -222,161 +94,123 @@ fn parse_decimal<E: serde::de::Error>(value: &str) -> std::result::Result<Intege
         .map_err(|_| E::custom("invalid decimal integer"))
 }
 
-fn parse_decimal_checked(value: &str) -> Result<Integer> {
-    Integer::parse(value.trim())
-        .map(Integer::from)
-        .map_err(|_| anyhow!("invalid decimal integer"))
+mod decimal {
+    use super::*;
+
+    pub fn serialize<S>(value: &Integer, serializer: S) -> std::result::Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.serialize_str(&value.to_string())
+    }
+
+    pub fn deserialize<'de, D>(deserializer: D) -> std::result::Result<Integer, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        parse_decimal(&String::deserialize(deserializer)?)
+    }
 }
 
-fn parse_decimal_vec_checked(values: &[String]) -> Result<Vec<Integer>> {
-    values
-        .iter()
-        .map(|value| parse_decimal_checked(value))
-        .collect()
-}
+mod decimal_vec {
+    use super::*;
 
-fn parse_decimal_matrix_checked(values: &[Vec<String>]) -> Result<Vec<Vec<Integer>>> {
-    values
-        .iter()
-        .map(|row| parse_decimal_vec_checked(row))
-        .collect()
-}
-
-fn deserialize_decimal<'de, D>(deserializer: D) -> std::result::Result<Integer, D::Error>
-where
-    D: Deserializer<'de>,
-{
-    parse_decimal(&String::deserialize(deserializer)?)
-}
-
-fn deserialize_decimal_vec<'de, D>(
-    deserializer: D,
-) -> std::result::Result<Vec<Integer>, D::Error>
-where
-    D: Deserializer<'de>,
-{
-    Vec::<String>::deserialize(deserializer)?
-        .into_iter()
-        .map(|value| parse_decimal(&value))
-        .collect()
-}
-
-fn deserialize_decimal_matrix<'de, D>(
-    deserializer: D,
-) -> std::result::Result<Vec<Vec<Integer>>, D::Error>
-where
-    D: Deserializer<'de>,
-{
-    Vec::<Vec<String>>::deserialize(deserializer)?
-        .into_iter()
-        .map(|row| {
-            row.into_iter()
-                .map(|value| parse_decimal(&value))
-                .collect()
-        })
-        .collect()
-}
-
-fn deserialize_sparse_decimal_vectors<'de, D>(
-    deserializer: D,
-) -> std::result::Result<Vec<Vec<(usize, Integer)>>, D::Error>
-where
-    D: Deserializer<'de>,
-{
-    Vec::<Vec<(usize, String)>>::deserialize(deserializer)?
-        .into_iter()
-        .map(|weight| {
-            weight
-                .into_iter()
-                .map(|(index, value)| {
-                    Ok::<_, D::Error>((index, parse_decimal::<D::Error>(&value)?))
-                })
-                .collect::<std::result::Result<Vec<_>, D::Error>>()
-        })
-        .collect()
-}
-
-/// Builds the checker's typed representation directly from a generated
-/// certificate, without serializing or parsing JSON.
-pub fn parse_generated_certificate(raw: &Certificate) -> Result<ParsedCertificate> {
-    let inequalities = raw
-        .inequalities
-        .iter()
-        .map(|inequality| {
-            Ok(ParsedInequality {
-                a: parse_decimal_vec_checked(&inequality.a)?,
-                b: parse_decimal_checked(&inequality.b)?,
-            })
-        })
-        .collect::<Result<Vec<_>>>()?;
-
-    let items = raw
-        .items
-        .iter()
-        .map(|item| {
-            Ok(ParsedVertexItem {
-                incident: item.incident.clone(),
-                vertex: ParsedVertexCoords {
-                    num: parse_decimal_vec_checked(&item.vertex.num)?,
-                    den: parse_decimal_checked(&item.vertex.den)?,
-                },
-            })
-        })
-        .collect::<Result<Vec<_>>>()?;
-
-    let graph = ParsedSimplexGraph {
-        g: raw.graph.g.clone(),
-        lbl: raw
-            .graph
-            .lbl
+    pub fn serialize<S>(values: &[Integer], serializer: S) -> std::result::Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        values
             .iter()
-            .map(|label| ParsedGraphLabel {
-                simplex: label.simplex.clone(),
-                owner: label.owner,
-            })
-            .collect(),
-    };
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .serialize(serializer)
+    }
 
-    let full_dim = ParsedFullDimCertificate {
-        denominator: parse_decimal_checked(&raw.full_dim.denominator)?,
-        point: parse_decimal_vec_checked(&raw.full_dim.point)?,
-        directions: parse_decimal_matrix_checked(&raw.full_dim.directions)?,
-        left_inverse: parse_decimal_matrix_checked(&raw.full_dim.left_inverse)?,
-    };
-
-    let root = ParsedRoot {
-        simplex_id: raw.root.simplex_id,
-        inverse_incident_map: raw.root.inverse_incident_map.clone(),
-        basis_vectors: parse_decimal_matrix_checked(&raw.root.basis_vectors)?,
-        m_matrix: parse_decimal_matrix_checked(&raw.root.m_matrix)?,
-        q_vectors: raw
-            .root
-            .q_vectors
-            .iter()
-            .map(|weight| {
-                weight
-                    .iter()
-                    .map(|(index, value)| Ok((*index, parse_decimal_checked(value)?)))
-                    .collect::<Result<Vec<_>>>()
-            })
-            .collect::<Result<Vec<_>>>()?,
-    };
-
-    Ok(ParsedCertificate {
-        n_inequalities: raw.n_inequalities,
-        dimension: raw.dimension,
-        inequalities,
-        items,
-        graph,
-        neighbors: raw.neighbors.clone(),
-        geom_edge_lifts: raw.geom_edge_lifts.clone(),
-        full_dim,
-        root,
-    })
+    pub fn deserialize<'de, D>(deserializer: D) -> std::result::Result<Vec<Integer>, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        Vec::<String>::deserialize(deserializer)?
+            .into_iter()
+            .map(|value| parse_decimal(&value))
+            .collect()
+    }
 }
 
-/// Reads the JSON certificate and parses all decimal integers exactly once.
-pub fn read_parsed_certificate(path: &str) -> Result<ParsedCertificate> {
+mod decimal_matrix {
+    use super::*;
+
+    pub fn serialize<S>(
+        values: &[Vec<Integer>],
+        serializer: S,
+    ) -> std::result::Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        values
+            .iter()
+            .map(|row| row.iter().map(ToString::to_string).collect::<Vec<_>>())
+            .collect::<Vec<_>>()
+            .serialize(serializer)
+    }
+
+    pub fn deserialize<'de, D>(
+        deserializer: D,
+    ) -> std::result::Result<Vec<Vec<Integer>>, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        Vec::<Vec<String>>::deserialize(deserializer)?
+            .into_iter()
+            .map(|row| {
+                row.into_iter()
+                    .map(|value| parse_decimal(&value))
+                    .collect::<std::result::Result<Vec<_>, D::Error>>()
+            })
+            .collect()
+    }
+}
+
+mod sparse_decimal_vectors {
+    use super::*;
+
+    pub fn serialize<S>(
+        values: &[Vec<(usize, Integer)>],
+        serializer: S,
+    ) -> std::result::Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        values
+            .iter()
+            .map(|row| {
+                row.iter()
+                    .map(|(index, value)| (*index, value.to_string()))
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>()
+            .serialize(serializer)
+    }
+
+    pub fn deserialize<'de, D>(
+        deserializer: D,
+    ) -> std::result::Result<Vec<Vec<(usize, Integer)>>, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        Vec::<Vec<(usize, String)>>::deserialize(deserializer)?
+            .into_iter()
+            .map(|row| {
+                row.into_iter()
+                    .map(|(index, value)| Ok((index, parse_decimal::<D::Error>(&value)?)))
+                    .collect::<std::result::Result<Vec<_>, D::Error>>()
+            })
+            .collect()
+    }
+}
+
+/// Reads JSON while decoding decimal strings directly into GMP integers.
+pub fn read_certificate(path: &str) -> Result<Certificate> {
     let text =
         fs::read_to_string(path).with_context(|| format!("failed to read certificate `{path}`"))?;
 
@@ -389,5 +223,23 @@ pub fn certificate_to_string(cert: &Certificate, pretty: bool) -> Result<String>
         Ok(serde_json::to_string_pretty(cert)?)
     } else {
         Ok(serde_json::to_string(cert)?)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn integer_fields_round_trip_as_decimal_strings() {
+        let coords = VertexCoords {
+            num: vec![Integer::from(-7), Integer::from(1) << 200usize],
+            den: Integer::from(11),
+        };
+        let json = serde_json::to_string(&coords).unwrap();
+        assert!(json.contains("\"-7\""));
+        let large = Integer::from(1) << 200usize;
+        assert!(json.contains(&format!("\"{large}\"")));
+        assert_eq!(serde_json::from_str::<VertexCoords>(&json).unwrap(), coords);
     }
 }

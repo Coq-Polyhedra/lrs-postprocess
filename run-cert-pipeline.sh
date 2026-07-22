@@ -190,12 +190,9 @@ stream_certificate_timings() {
             "Create certificate in memory: "*" s")
                 label="total certificate creation:"
                 ;;
-            "Prepare in-memory checker input: "*" s")
+            "Inequality file check: "*" s")
                 echo
                 echo "Rust certificate check:"
-                label="prepare checker input:"
-                ;;
-            "Inequality file check: "*" s")
                 label="inequality-file check:"
                 ;;
             "Well-formedness check: "*" s")
@@ -602,7 +599,6 @@ run_one() {
         run|all)
             compute_ext "$base"
             generate_binary_certificate "$base"
-            run_coq_binreader_test "$base"
             ;;
         clean)
             clean_generated "$base"
@@ -617,13 +613,13 @@ run_one() {
 usage() {
     cat <<EOF
 Usage:
-  $0 BASE[.ine] [BASE[.ine] ...]
-  $0 run    BASE[.ine] [BASE[.ine] ...]
+  $0 PATTERN[.ine] [PATTERN[.ine] ...]
+  $0 run    PATTERN[.ine] [PATTERN[.ine] ...]
   $0 build
-  $0 lrs    BASE[.ine] [BASE[.ine] ...]
-  $0 cert   BASE[.ine] [BASE[.ine] ...]
-  $0 rocq   BASE[.ine] [BASE[.ine] ...]
-  $0 clean  BASE[.ine] [BASE[.ine] ...]
+  $0 lrs    PATTERN[.ine] [PATTERN[.ine] ...]
+  $0 cert   PATTERN[.ine] [PATTERN[.ine] ...]
+  $0 rocq   PATTERN[.ine] [PATTERN[.ine] ...]
+  $0 clean  PATTERN[.ine] [PATTERN[.ine] ...]
 
 The default command is 'run'. It executes the complete production pipeline:
   lrs -> create certificate -> Rust check -> binary encoding -> Rocq check
@@ -634,10 +630,18 @@ Individual production stages:
   rocq    Check an existing BASE-cert.bin with Rocq.
 
 JSON diagnostics (not needed by the production pipeline):
-  $0 json         BASE[.ine] [BASE[.ine] ...]
+  $0 json   PATTERN[.ine] [PATTERN[.ine] ...]
 
 Compatibility aliases:
   all = run, ext = lrs, bin = cert, coq = rocq
+
+Instance selection:
+  Every PATTERN is a Bash extended regular expression matched against the
+  complete basename of each ${DATA_DIR}/*.ine file, without the .ine extension.
+  Thus 'cross10' selects exactly cross10.ine, while 'cross(8|9|10)' selects
+  cross8.ine, cross9.ine, and cross10.ine. A trailing .ine is accepted.
+  Matches are processed in lexicographic order and duplicates are removed.
+  The command fails if a pattern is invalid or matches no file.
 
 For each BASE, the script uses:
   ${DATA_DIR}/BASE.ine
@@ -661,6 +665,8 @@ Examples:
   $0 cross_9 cross_10 cross_11 cross_12
   $0 lrs cross_9.ine
   $0 cert cross_9 cross_10
+  $0 cert 'cross(8|9|10)'
+  $0 'dual_cyclic_d(1[4-9]|20)_n.*'
   $0 rocq cross_9
   $0 json cross_12
   $0 clean cross_9 cross_10
@@ -690,6 +696,74 @@ Environment variables:
 EOF
 }
 
+expand_patterns() {
+    local pattern_arg pattern anchored path filename base regex_status
+    local -a all_bases=() matches=()
+    local -A selected=()
+
+    if [[ ! -d "$DATA_DIR" ]]; then
+        echo "error: data directory not found: $DATA_DIR" >&2
+        exit 1
+    fi
+
+    while IFS= read -r path; do
+        filename="${path##*/}"
+        all_bases+=("${filename%.ine}")
+    done < <(find "$DATA_DIR" -maxdepth 1 -type f -name '*.ine' -print | LC_ALL=C sort)
+
+    for pattern_arg in "$@"; do
+        pattern="${pattern_arg%.ine}"
+        anchored="^(${pattern})$"
+        matches=()
+
+        if [[ "" =~ $anchored ]]; then
+            :
+        else
+            regex_status=$?
+            if [[ "$regex_status" -eq 2 ]]; then
+                echo "error: invalid regular expression: $pattern_arg" >&2
+                exit 1
+            fi
+        fi
+
+        for base in "${all_bases[@]}"; do
+            if [[ "$base" =~ $anchored ]]; then
+                matches+=("$base")
+                selected["$base"]=1
+            fi
+        done
+
+        if [[ ${#matches[@]} -eq 0 ]]; then
+            echo "error: pattern matched no .ine basenames in $DATA_DIR: $pattern_arg" >&2
+            exit 1
+        fi
+    done
+
+    for base in "${all_bases[@]}"; do
+        if [[ -n "${selected[$base]+x}" ]]; then
+            printf '%s\n' "$base"
+        fi
+    done
+}
+
+run_patterns() {
+    local command="$1"
+    shift
+    local expanded base
+    local -a bases
+
+    expanded="$(expand_patterns "$@")"
+    mapfile -t bases <<< "$expanded"
+
+    for base in "${bases[@]}"; do
+        echo
+        echo "########################################"
+        echo "# Processing $base"
+        echo "########################################"
+        run_one "$command" "$base"
+    done
+}
+
 if [[ $# -lt 1 ]]; then
     usage
     exit 1
@@ -713,31 +787,16 @@ case "$cmd" in
         ;;
     run|all|lrs|ext|cert|bin|rocq|coq|json|clean)
         if [[ $# -lt 1 ]]; then
-            echo "error: expected at least one basename" >&2
+            echo "error: expected at least one instance pattern" >&2
             usage
             exit 1
         fi
-
-        for base_arg in "$@"; do
-            base="${base_arg%.ine}"
-            echo
-            echo "########################################"
-            echo "# Processing $base"
-            echo "########################################"
-            run_one "$cmd" "$base"
-        done
+        run_patterns "$cmd" "$@"
         ;;
     *)
-        # With no explicit command, treat every argument as an input basename
-        # and run the complete production pipeline.
+        # With no explicit command, treat every argument as an instance pattern
+        # and run the complete production pipeline on all matching basenames.
         set -- "$cmd" "$@"
-        for base_arg in "$@"; do
-            base="${base_arg%.ine}"
-            echo
-            echo "########################################"
-            echo "# Processing $base"
-            echo "########################################"
-            run_one run "$base"
-        done
+        run_patterns run "$@"
         ;;
 esac

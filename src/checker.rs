@@ -3,18 +3,8 @@ use rug::{Complete, Integer};
 use std::collections::VecDeque;
 use std::time::Instant;
 
-use crate::certificate::{
-    parse_generated_certificate, read_parsed_certificate, Certificate as GeneratedCertificate,
-    ParsedCertificate as Certificate, ParsedInequality,
-};
-use crate::numerics::q_to_string;
+use crate::certificate::{read_certificate, Certificate, Inequality};
 use crate::postprocess::{parse_lrs_hrep, HRep};
-
-// Parsing below is only for the external .ine file. All integers contained in
-// the certificate are parsed by read_parsed_certificate.
-fn parse_hrep_integer(s: &str) -> Option<Integer> {
-    Integer::parse(s.trim()).ok().map(Integer::from)
-}
 
 fn has_matrix_shape<T>(matrix: &[Vec<T>], rows: usize, columns: usize) -> bool {
     matrix.len() == rows && matrix.iter().all(|row| row.len() == columns)
@@ -91,54 +81,21 @@ fn is_undirected(graph: &[Vec<usize>]) -> bool {
     })
 }
 
-fn parse_rational_parts(s: &str) -> Option<(Integer, Integer)> {
-    let s = s.trim();
-    let (mut numerator, mut denominator) = if let Some((a, b)) = s.split_once('/') {
-        (parse_hrep_integer(a)?, parse_hrep_integer(b)?)
-    } else {
-        (parse_hrep_integer(s)?, Integer::from(1))
-    };
-
-    if denominator == 0 {
-        return None;
-    }
-    if denominator < 0 {
-        numerator = -numerator;
-        denominator = -denominator;
-    }
-
-    let gcd = numerator.as_abs().gcd_ref(&denominator).complete();
-    numerator /= &gcd;
-    denominator /= gcd;
-    Some((numerator, denominator))
-}
-
-fn clear_rationals_to_integer_row(values: &[String]) -> Option<Vec<Integer>> {
-    let parts = values
-        .iter()
-        .map(|value| parse_rational_parts(value))
-        .collect::<Option<Vec<_>>>()?;
-    let lcm = parts.iter().fold(Integer::from(1), |acc, (_, denominator)| {
-        acc.lcm_ref(denominator).complete()
-    });
-    Some(
-        parts
-            .into_iter()
-            .map(|(mut numerator, denominator)| {
-                let scale = &lcm / denominator;
-                numerator *= scale;
-                numerator
-            })
-            .collect(),
-    )
-}
-
 fn integer_inequality_from_hrep(h: &HRep, i: usize) -> Option<(Vec<Integer>, Integer)> {
-    let mut values = h.a.get(i)?.iter().map(q_to_string).collect::<Vec<_>>();
-    values.push(q_to_string(h.b.get(i)?));
-    let cleared = clear_rationals_to_integer_row(&values)?;
-    let bound = cleared.last()?.clone();
-    Some((cleared[..cleared.len() - 1].to_vec(), bound))
+    let a = h.a.get(i)?;
+    let b = h.b.get(i)?;
+    let lcm = a
+        .iter()
+        .chain(std::iter::once(b))
+        .fold(Integer::from(1), |acc, value| {
+            acc.lcm_ref(value.denom()).complete()
+        });
+    let clear = |value: &rug::Rational| {
+        let mut integer = value.numer().clone();
+        integer *= (&lcm / value.denom()).complete();
+        integer
+    };
+    Some((a.iter().map(|value| clear(value)).collect(), clear(b)))
 }
 
 // Rust-specific check: the Rocq checker receives the integer inequalities
@@ -407,7 +364,7 @@ mod rocq {
     }
 
     pub fn check_ineqs(
-        inequalities: &[ParsedInequality],
+        inequalities: &[Inequality],
         active_set: &[usize],
         numerators: &[Integer],
         denominator: &Integer,
@@ -813,7 +770,7 @@ fn timed_bool(name: &str, check: impl FnOnce() -> bool) -> bool {
     result
 }
 
-fn check_parsed_certificate(h: &HRep, cert: &Certificate) -> Result<()> {
+fn check_in_memory_certificate(h: &HRep, cert: &Certificate) -> Result<()> {
     let inequality_file_check =
         timed_bool("Inequality file check", || check_ine_file(h, cert));
     let well_formedness =
@@ -845,14 +802,8 @@ fn check_parsed_certificate(h: &HRep, cert: &Certificate) -> Result<()> {
 
 /// Checks a certificate immediately after generation, without a JSON
 /// serialization/write/read/parse round trip.
-pub fn check_generated_certificate(h: &HRep, generated: &GeneratedCertificate) -> Result<()> {
-    let start = Instant::now();
-    let cert = parse_generated_certificate(generated)?;
-    eprintln!(
-        "Prepare in-memory checker input: {:.6} s",
-        start.elapsed().as_secs_f64()
-    );
-    check_parsed_certificate(h, &cert)
+pub fn check_generated_certificate(h: &HRep, cert: &Certificate) -> Result<()> {
+    check_in_memory_certificate(h, cert)
 }
 
 pub fn check_certificate(ine_path: &str, certificate_path: &str) -> Result<()> {
@@ -864,10 +815,10 @@ pub fn check_certificate(ine_path: &str, certificate_path: &str) -> Result<()> {
     );
 
     let start = Instant::now();
-    let cert = read_parsed_certificate(certificate_path)?;
+    let cert = read_certificate(certificate_path)?;
     eprintln!("Read certificate: {:.6} s", start.elapsed().as_secs_f64());
 
-    check_parsed_certificate(&h, &cert)
+    check_in_memory_certificate(&h, &cert)
 }
 
 #[cfg(test)]

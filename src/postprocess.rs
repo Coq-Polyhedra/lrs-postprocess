@@ -6,7 +6,7 @@ use std::hash::{BuildHasherDefault, Hasher};
 use std::io::{BufRead, BufReader};
 
 use crate::certificate::{FullDimCertificate, GraphLabel, Inequality, Root, SimplexGraph, VertexCoords, VertexItem};
-use crate::numerics::{invert_matrix, parse_q, q_to_string, Q};
+use crate::numerics::{invert_matrix, parse_q, Q};
 
 #[derive(Debug, Clone)]
 pub struct HRep {
@@ -42,13 +42,13 @@ fn vertex_coords_from_strings(v: &[String]) -> Result<VertexCoords> {
         .map(|(num, den)| {
             let mut value = num.clone();
             value *= (&lcm / den).complete();
-            value.to_string()
+            value
         })
         .collect();
 
     Ok(VertexCoords {
         num: cleared,
-        den: lcm.to_string(),
+        den: lcm,
     })
 }
 
@@ -72,14 +72,13 @@ fn vertex_coords_from_common_denominator(
             Integer::parse(numerator.trim())
                 .ok()
                 .map(Integer::from)
-                .map(|value| value.to_string())
                 .with_context(|| format!("invalid common vertex numerator {j}: `{numerator}`"))
         })
         .collect::<Result<Vec<_>>>()?;
 
     Ok(VertexCoords {
         num: numerators,
-        den: denominator.to_string(),
+        den: denominator,
     })
 }
 
@@ -798,22 +797,9 @@ fn integer_inequality_coefficients(h: &HRep) -> Result<Vec<Vec<Integer>>> {
         .zip(&h.b)
         .enumerate()
         .map(|(i, (a, b))| {
-            let mut values = a.iter().map(q_to_string).collect::<Vec<_>>();
-            values.push(q_to_string(b));
-            let cleared = clear_rationals_to_integer_row(&values)
-                .with_context(|| format!("failed to clear denominators of inequality {i}"))?;
-            cleared[..cleared.len() - 1]
-                .iter()
-                .enumerate()
-                .map(|(j, s)| {
-                    Integer::parse(s)
-                        .ok()
-                        .map(Integer::from)
-                        .ok_or_else(|| {
-                        anyhow!("internal error: cleared coefficient {j} of inequality {i} is not an integer: {s}")
-                    })
-                })
-                .collect::<Result<Vec<_>>>()
+            integer_inequality_from_q_row(a, b)
+                .map(|inequality| inequality.a)
+                .with_context(|| format!("failed to clear denominators of inequality {i}"))
         })
         .collect()
 }
@@ -909,7 +895,7 @@ fn sparse_nonnegative_certificate_for_simplex(
     incident: &[usize],
     simplex: &[usize],
     d: usize,
-) -> Result<Vec<(usize, String)>> {
+) -> Result<Vec<(usize, Integer)>> {
     let local_rows = simplex
         .iter()
         .map(|&row| {
@@ -964,7 +950,7 @@ fn sparse_nonnegative_certificate_for_simplex(
                     .iter()
                     .zip(coeffs.iter())
                     .filter(|(_, c)| *c != &0)
-                    .map(|(&j, c)| (j, c.to_string()))
+                    .map(|(&j, c)| (j, c.clone()))
                     .collect::<Vec<_>>();
 
                 if sparse.is_empty() {
@@ -1066,14 +1052,8 @@ pub fn root_certificate(h: &HRep, items: &[VertexItem], graph: &SimplexGraph, k0
     Ok(Root {
         simplex_id,
         inverse_incident_map,
-        basis_vectors: basis
-            .iter()
-            .map(|row| row.iter().map(ToString::to_string).collect())
-            .collect(),
-        m_matrix: m_matrix
-            .iter()
-            .map(|row| row.iter().map(ToString::to_string).collect())
-            .collect(),
+        basis_vectors: basis,
+        m_matrix,
         q_vectors,
     })
 }
@@ -1087,24 +1067,13 @@ fn vertex_coords_to_q(vertex: &VertexCoords, d: usize) -> Result<Vec<Q>> {
             vertex.num.len()
         );
     }
-    let den = Integer::parse(vertex.den.trim())
-        .ok()
-        .map(Integer::from)
-        .ok_or_else(|| anyhow!("invalid vertex denominator `{}`", vertex.den))?;
-    if den <= 0 {
-        bail!("vertex denominator must be positive, got {den}");
+    if vertex.den <= 0 {
+        bail!("vertex denominator must be positive, got {}", vertex.den);
     }
     vertex
         .num
         .iter()
-        .enumerate()
-        .map(|(j, x)| {
-            let num = Integer::parse(x.trim())
-                .ok()
-                .map(Integer::from)
-                .ok_or_else(|| anyhow!("invalid vertex numerator at coordinate {j}: `{x}`"))?;
-            Ok(Q::from((num, den.clone())))
-        })
+        .map(|num| Ok(Q::from((num.clone(), vertex.den.clone()))))
         .collect()
 }
 
@@ -1287,16 +1256,10 @@ pub fn build_full_dim_certificate(
         .collect::<Vec<_>>();
 
     Ok(FullDimCertificate {
-        denominator: q.to_string(),
-        point: p.iter().map(ToString::to_string).collect(),
-        directions: r
-            .iter()
-            .map(|row| row.iter().map(ToString::to_string).collect())
-            .collect(),
-        left_inverse: u
-            .iter()
-            .map(|row| row.iter().map(ToString::to_string).collect())
-            .collect(),
+        denominator: q,
+        point: p,
+        directions: r,
+        left_inverse: u,
     })
 }
 
@@ -1329,49 +1292,34 @@ V#2 R#0 B#2 h=1 facets  3 4 I#2 det= 1
 
         assert_eq!(items.len(), 2);
         assert_eq!(labels.len(), 2);
-        assert_eq!(items[0].vertex.den, "3");
-        assert_eq!(items[0].vertex.num, ["1", "-2"]);
-        assert_eq!(items[1].vertex.den, "5");
-        assert_eq!(items[1].vertex.num, ["6", "7"]);
+        assert_eq!(items[0].vertex.den, 3);
+        assert_eq!(
+            items[0].vertex.num,
+            vec![Integer::from(1), Integer::from(-2)]
+        );
+        assert_eq!(items[1].vertex.den, 5);
+        assert_eq!(
+            items[1].vertex.num,
+            vec![Integer::from(6), Integer::from(7)]
+        );
     }
-}
-
-fn clear_rationals_to_integer_row(values: &[String]) -> Result<Vec<String>> {
-    let mut nums = Vec::<Integer>::with_capacity(values.len());
-    let mut dens = Vec::<Integer>::with_capacity(values.len());
-
-    for s in values {
-        let (num, den) = parse_rational_parts(s)
-            .with_context(|| format!("failed to parse rational `{s}` while clearing denominators"))?;
-        nums.push(num);
-        dens.push(den);
-    }
-
-    let lcm = dens
-        .iter()
-        .fold(Integer::from(1), |acc, den| acc.lcm_ref(den).complete());
-
-    Ok(nums
-        .iter()
-        .zip(&dens)
-        .map(|(num, den)| {
-            let mut value = num.clone();
-            value *= (&lcm / den).complete();
-            value.to_string()
-        })
-        .collect())
 }
 
 fn integer_inequality_from_q_row(a: &[Q], b: &Q) -> Result<Inequality> {
-    let mut values = a.iter().map(q_to_string).collect::<Vec<_>>();
-    values.push(q_to_string(b));
+    let lcm = a
+        .iter()
+        .chain(std::iter::once(b))
+        .fold(Integer::from(1), |acc, value| {
+            acc.lcm_ref(value.denom()).complete()
+        });
 
-    let cleared = clear_rationals_to_integer_row(&values)?;
-    let rhs = cleared
-        .last()
-        .cloned()
-        .ok_or_else(|| anyhow!("empty inequality row after clearing denominators"))?;
-    let coeffs = cleared[..cleared.len() - 1].to_vec();
+    let clear = |value: &Q| {
+        let mut integer = value.numer().clone();
+        integer *= (&lcm / value.denom()).complete();
+        integer
+    };
+    let coeffs = a.iter().map(|value| clear(value)).collect();
+    let rhs = clear(b);
 
     Ok(Inequality { a: coeffs, b: rhs })
 }
