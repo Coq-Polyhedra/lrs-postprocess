@@ -13,8 +13,8 @@ use certificate::{certificate_to_string, Certificate};
 use checker::{check_certificate, check_generated_certificate};
 use postprocess::{
     build_full_dim_certificate, build_item_neighbors_and_lifts,
-    build_simplex_graph, certificate_inequalities, choose_default_k0,
-    parse_lrs_ext_items, parse_lrs_hrep, root_certificate,
+    build_simplex_graph, build_vertex_flags, certificate_inequalities,
+    choose_default_k0, parse_lrs_ext_items, parse_lrs_hrep, root_certificate,
 };
 
 #[derive(Debug, Clone)]
@@ -217,7 +217,7 @@ fn run_postprocess(args: PostprocessArgs) -> Result<()> {
     );
 
     let start = Instant::now();
-    let (items, labels) = parse_lrs_ext_items(&args.ext_path, h.d, h.a.len())
+    let (mut items, labels) = parse_lrs_ext_items(&args.ext_path, h.d, h.a.len())
         .context("failed to parse lrs ext output")?;
     let read_ext_elapsed = start.elapsed();
     eprintln!(
@@ -283,6 +283,18 @@ fn run_postprocess(args: PostprocessArgs) -> Result<()> {
     eprintln!(
         "Certificate: build geometric graph and lifts: {:.6} s",
         geom_graph_elapsed.as_secs_f64()
+    );
+
+    let start = Instant::now();
+    let vertex_flags = build_vertex_flags(&items, &neighbors, h.d)
+        .context("failed to build complete vertex flags")?;
+    for (item, flag) in items.iter_mut().zip(vertex_flags) {
+        item.flag = flag;
+    }
+    let vertex_flags_elapsed = start.elapsed();
+    eprintln!(
+        "Certificate: build complete vertex flags: {:.6} s",
+        vertex_flags_elapsed.as_secs_f64()
     );
 
     let start = Instant::now();

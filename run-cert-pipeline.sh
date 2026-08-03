@@ -181,6 +181,9 @@ stream_certificate_timings() {
             "Certificate: build geometric graph and lifts: "*" s")
                 label="build geometric graph and lifts:"
                 ;;
+            "Certificate: build complete vertex flags: "*" s")
+                label="build complete vertex flags:"
+                ;;
             "Certificate: build full-dimensionality certificate: "*" s")
                 label="build full-dimensionality certificate:"
                 ;;
@@ -204,6 +207,9 @@ stream_certificate_timings() {
             "Feasibility check: "*" s")
                 label="feasibility check:"
                 ;;
+            "Vertexhood flag check: "*" s")
+                label="vertexhood flag check:"
+                ;;
             "Graph check: "*" s")
                 label="graph check:"
                 ;;
@@ -213,8 +219,8 @@ stream_certificate_timings() {
             "Root check: "*" s")
                 label="root check:"
                 ;;
-            "Geometric graph check: "*" s")
-                label="geometric-graph check:"
+            "Ridge graph image check: "*" s")
+                label="ridge graph image check:"
                 ;;
             "Full dimension check: "*" s")
                 label="full-dimension check:"

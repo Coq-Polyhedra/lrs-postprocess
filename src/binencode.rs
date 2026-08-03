@@ -2,7 +2,10 @@ use anyhow::{bail, Result};
 use rug::{Complete, Integer};
 use std::io::Write;
 
-use crate::certificate::{Certificate, FullDimCertificate, GraphLabel, Inequality, Root, SimplexGraph, VertexCoords, VertexItem};
+use crate::certificate::{
+    Certificate, FullDimCertificate, GraphLabel, Inequality, Root, SimplexGraph, VertexCoords,
+    VertexItem,
+};
 
 #[derive(Clone, Debug)]
 enum Descr {
@@ -131,8 +134,11 @@ fn vertex_coords_descr() -> Descr {
 }
 
 fn item_descr() -> Descr {
-    // item := incident * vertex
-    pair(array(Descr::Int63), vertex_coords_descr())
+    // flag := local_inequalities * witness_items
+    let flag = pair(array(Descr::Int63), array(Descr::Int63));
+
+    // item := incident * (vertex * flag)
+    pair(array(Descr::Int63), pair(vertex_coords_descr(), flag))
 }
 
 fn graph_label_descr() -> Descr {
@@ -159,10 +165,7 @@ fn full_dim_descr() -> Descr {
     // full_dim := (point * denominator) * (direction_columns * left_inverse)
     pair(
         pair(array(Descr::BigZ), Descr::BigN),
-        pair(
-            array(array(Descr::BigZ)),
-            array(array(Descr::BigZ)),
-        ),
+        pair(array(array(Descr::BigZ)), array(array(Descr::BigZ))),
     )
 }
 
@@ -195,10 +198,7 @@ fn certificate_descr() -> Descr {
     //       (geom *
     //        (full_dim * root))))))
     let int_matrix = || array(array(Descr::Int63));
-    let geom_descr = pair(
-        int_matrix(),
-        pair(int_matrix(), int_matrix()),
-    );
+    let geom_descr = pair(int_matrix(), pair(int_matrix(), int_matrix()));
 
     pair(
         Descr::Int63,
@@ -210,10 +210,7 @@ fn certificate_descr() -> Descr {
                     array(item_descr()),
                     pair(
                         graph_descr(),
-                        pair(
-                            geom_descr,
-                            pair(full_dim_descr(), root_descr()),
-                        ),
+                        pair(geom_descr, pair(full_dim_descr(), root_descr())),
                     ),
                 ),
             ),
@@ -262,9 +259,11 @@ fn write_vertex_coords<W: Write>(w: &mut W, vertex: &VertexCoords) -> Result<()>
 }
 
 fn write_item<W: Write>(w: &mut W, item: &VertexItem) -> Result<()> {
-    // item := incident * vertex
+    // item := incident * (vertex * (local_inequalities * witness_items))
     write_usize_array(w, &item.incident)?;
     write_vertex_coords(w, &item.vertex)?;
+    write_usize_array(w, &item.flag.0)?;
+    write_usize_array(w, &item.flag.1)?;
     Ok(())
 }
 
@@ -280,7 +279,9 @@ fn write_graph<W: Write>(w: &mut W, graph: &SimplexGraph) -> Result<()> {
     write_usize_matrix(w, &graph.g)?;
 
     let label_d = graph_label_descr();
-    write_array(w, &label_d, &graph.lbl, |w, label| write_graph_label(w, label))?;
+    write_array(w, &label_d, &graph.lbl, |w, label| {
+        write_graph_label(w, label)
+    })?;
 
     Ok(())
 }
@@ -296,9 +297,7 @@ fn write_sparse_vector<W: Write>(w: &mut W, sparse: &[(usize, Integer)]) -> Resu
     write_array(w, &entry_d, sparse, |w, entry| write_sparse_entry(w, entry))
 }
 
-fn split_geom_edge_lifts(
-    cert: &Certificate,
-) -> Result<(Vec<Vec<usize>>, Vec<Vec<usize>>)> {
+fn split_geom_edge_lifts(cert: &Certificate) -> Result<(Vec<Vec<usize>>, Vec<Vec<usize>>)> {
     if cert.geom_edge_lifts.len() != cert.neighbors.len() {
         bail!(
             "geom_edge_lifts has {} rows, but neighbors has {} rows",
@@ -331,9 +330,7 @@ fn split_geom_edge_lifts(
             lift_row.iter().zip(neighbor_row.iter()).enumerate()
         {
             let source_label = cert.graph.lbl.get(source).ok_or_else(|| {
-                anyhow::anyhow!(
-                    "geom_edge_lifts[{v}][{j}] has invalid source simplex {source}"
-                )
+                anyhow::anyhow!("geom_edge_lifts[{v}][{j}] has invalid source simplex {source}")
             })?;
 
             if source_label.owner != v {
@@ -344,9 +341,7 @@ fn split_geom_edge_lifts(
             }
 
             let target_label = cert.graph.lbl.get(target).ok_or_else(|| {
-                anyhow::anyhow!(
-                    "geom_edge_lifts[{v}][{j}] has invalid target simplex {target}"
-                )
+                anyhow::anyhow!("geom_edge_lifts[{v}][{j}] has invalid target simplex {target}")
             })?;
 
             if target_label.owner != neighbor {
@@ -400,7 +395,9 @@ fn write_root<W: Write>(w: &mut W, root: &Root) -> Result<()> {
     write_bigz_matrix(w, &root.m_matrix)?;
 
     let sparse_d = sparse_vector_descr();
-    write_array(w, &sparse_d, &root.q_vectors, |w, sparse| write_sparse_vector(w, sparse))?;
+    write_array(w, &sparse_d, &root.q_vectors, |w, sparse| {
+        write_sparse_vector(w, sparse)
+    })?;
     Ok(())
 }
 
@@ -420,8 +417,7 @@ fn write_certificate_value<W: Write>(w: &mut W, cert: &Certificate) -> Result<()
 
     // geom := neighbors * (geom_edge_sources * geom_edge_local_targets)
     write_usize_matrix(w, &cert.neighbors)?;
-    let (geom_edge_sources, geom_edge_local_targets) =
-        split_geom_edge_lifts(cert)?;
+    let (geom_edge_sources, geom_edge_local_targets) = split_geom_edge_lifts(cert)?;
     write_usize_matrix(w, &geom_edge_sources)?;
     write_usize_matrix(w, &geom_edge_local_targets)?;
 
@@ -454,9 +450,7 @@ mod tests {
 
     #[test]
     fn bign_uses_63_bit_little_endian_limbs() {
-        let n = (Integer::from(1) << 126usize)
-            + (Integer::from(7) << 63usize)
-            + 5;
+        let n = (Integer::from(1) << 126usize) + (Integer::from(7) << 63usize) + 5;
         let mut output = Vec::new();
         write_bign(&mut output, &n).unwrap();
         assert_eq!(words(&output), vec![3, 5, 7, 1]);
@@ -469,4 +463,33 @@ mod tests {
         assert_eq!(words(&output), vec![0, 1, 5]);
     }
 
+    #[test]
+    fn item_encoding_appends_the_complete_flag_pair() {
+        let mut descriptor = Vec::new();
+        write_descr(&mut descriptor, &item_descr()).unwrap();
+        assert_eq!(
+            words(&descriptor),
+            vec![4, 5, 0, 4, 4, 5, 2, 1, 4, 5, 0, 5, 0]
+        );
+
+        let item = VertexItem {
+            incident: vec![2, 5],
+            vertex: VertexCoords {
+                num: vec![Integer::from(7), Integer::from(-3)],
+                den: Integer::from(11),
+            },
+            flag: (vec![0, 1], vec![4, 1]),
+        };
+        let mut value = Vec::new();
+        write_item(&mut value, &item).unwrap();
+        assert_eq!(
+            words(&value),
+            vec![
+                2, 0, 2, 5, // incident
+                2, 1, 0, 1, 1, 7, 0, 1, 3, 1, 11, // vertex
+                2, 0, 0, 1, // local flag inequalities
+                2, 0, 4, 1, // global witness items
+            ]
+        );
+    }
 }

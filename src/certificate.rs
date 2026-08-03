@@ -42,6 +42,13 @@ pub struct VertexCoords {
 pub struct VertexItem {
     pub incident: Vec<usize>,
     pub vertex: VertexCoords,
+
+    /// A complete face flag above this point.
+    ///
+    /// `flag.0[k]` is a local index into `incident`. The corresponding
+    /// inequality cuts the face at level `k`. `flag.1[k]` is the global item
+    /// index of a feasible point witnessing that this cut is strict.
+    pub flag: (Vec<usize>, Vec<usize>),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -241,5 +248,28 @@ mod tests {
         let large = Integer::from(1) << 200usize;
         assert!(json.contains(&format!("\"{large}\"")));
         assert_eq!(serde_json::from_str::<VertexCoords>(&json).unwrap(), coords);
+    }
+
+    #[test]
+    fn vertex_item_flag_round_trips_as_two_index_sequences() {
+        let item = VertexItem {
+            incident: vec![0, 2, 5],
+            vertex: VertexCoords {
+                num: vec![Integer::from(1), Integer::from(-2)],
+                den: Integer::from(3),
+            },
+            flag: (vec![2, 0], vec![4, 1]),
+        };
+
+        let json = serde_json::to_string(&item).unwrap();
+        assert_eq!(
+            json,
+            r#"{"incident":[0,2,5],"vertex":{"num":["1","-2"],"den":"3"},"flag":[[2,0],[4,1]]}"#
+        );
+
+        let decoded: VertexItem = serde_json::from_str(&json).unwrap();
+        assert_eq!(decoded.incident, item.incident);
+        assert_eq!(decoded.vertex, item.vertex);
+        assert_eq!(decoded.flag, item.flag);
     }
 }

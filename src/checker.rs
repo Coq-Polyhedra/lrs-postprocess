@@ -1,9 +1,8 @@
 use anyhow::{anyhow, Context, Result};
 use rug::{Complete, Integer};
-use std::collections::VecDeque;
 use std::time::Instant;
 
-use crate::certificate::{read_certificate, Certificate, Inequality};
+use crate::certificate::{read_certificate, Certificate, Inequality, VertexItem};
 use crate::postprocess::{parse_lrs_hrep, HRep};
 
 fn has_matrix_shape<T>(matrix: &[Vec<T>], rows: usize, columns: usize) -> bool {
@@ -34,6 +33,59 @@ fn sparse_dot(weight: &[(usize, Integer)], x: &[Integer]) -> Option<Integer> {
 
 fn strictly_sorted(xs: &[usize]) -> bool {
     xs.windows(2).all(|w| w[0] < w[1])
+}
+
+fn flag_is_well_formed(item: &VertexItem, dimension: usize, item_count: usize) -> bool {
+    let (local_inequalities, witnesses) = &item.flag;
+    local_inequalities.len() == dimension
+        && witnesses.len() == dimension
+        && local_inequalities
+            .iter()
+            .all(|&local_index| local_index < item.incident.len())
+        && witnesses.iter().all(|&witness| witness < item_count)
+}
+
+fn complete_flag_check(items: &[VertexItem], item: &VertexItem, dimension: usize) -> bool {
+    if !flag_is_well_formed(item, dimension, items.len()) {
+        return false;
+    }
+
+    let (local_inequalities, witnesses) = &item.flag;
+    for k in 0..dimension {
+        let Some(&global_inequality) = local_inequalities
+            .get(k)
+            .and_then(|&local_index| item.incident.get(local_index))
+        else {
+            return false;
+        };
+        let Some(witness) = witnesses
+            .get(k)
+            .and_then(|&witness_index| items.get(witness_index))
+        else {
+            return false;
+        };
+
+        // The kth inequality must cut the preceding face strictly.
+        if witness.incident.binary_search(&global_inequality).is_ok() {
+            return false;
+        }
+
+        // The witness belongs to the face defined by the preceding prefix.
+        for &previous_local_index in &local_inequalities[..k] {
+            let Some(&previous_global_inequality) = item.incident.get(previous_local_index) else {
+                return false;
+            };
+            if witness
+                .incident
+                .binary_search(&previous_global_inequality)
+                .is_err()
+            {
+                return false;
+            }
+        }
+    }
+
+    true
 }
 
 fn sorted_subset(xs: &[usize], ys: &[usize]) -> bool {
@@ -143,8 +195,14 @@ mod rocq {
         })
     }
 
+    pub fn areFlagsWellFormed(cert: &Certificate) -> bool {
+        cert.items
+            .iter()
+            .all(|item| flag_is_well_formed(item, cert.dimension, cert.items.len()))
+    }
+
     pub fn areVerticesWellFormed(cert: &Certificate) -> bool {
-        arePointsWellFormed(cert) && areActiveSetsWellFormed(cert)
+        arePointsWellFormed(cert) && areActiveSetsWellFormed(cert) && areFlagsWellFormed(cert)
     }
 
     pub fn isGraphWellFormed(cert: &Certificate) -> bool {
@@ -401,6 +459,12 @@ mod rocq {
         })
     }
 
+    pub fn vertexhood_check(cert: &Certificate) -> bool {
+        cert.items
+            .iter()
+            .all(|item| complete_flag_check(&cert.items, item, cert.dimension))
+    }
+
     pub fn isRidgeInFacet(facet1: &[usize], facet2: &[usize], value: usize) -> bool {
         let difference = sorted_difference(facet1, facet2);
         difference.len() == 1 && difference[0] == value
@@ -557,7 +621,7 @@ mod rocq {
                 })
     }
 
-    pub fn graph_image_check(cert: &Certificate) -> bool {
+    pub fn ridge_graph_image_check(cert: &Certificate) -> bool {
         let graph_edges_are_mapped =
             cert.graph.g.iter().enumerate().all(|(source_facet, neighbors)| {
                 neighbors.iter().all(|&target_facet| {
@@ -605,70 +669,6 @@ mod rocq {
             });
 
         graph_edges_are_mapped && geom_edges_are_images
-    }
-
-    fn not_subset(xs: &[usize], ys: &[usize]) -> bool {
-        !sorted_subset(xs, ys)
-    }
-
-    fn incomparable(xs: &[usize], ys: &[usize]) -> bool {
-        not_subset(xs, ys) && not_subset(ys, xs)
-    }
-
-    pub fn geom_edge_pairwise_check(cert: &Certificate) -> bool {
-        cert.items.iter().enumerate().all(|(i, vertex)| {
-            let Some(neighbors) = cert.neighbors.get(i) else {
-                return false;
-            };
-            let Some(differences) = neighbors
-                .iter()
-                .map(|&neighbor| {
-                    cert.items.get(neighbor).map(|other_vertex| {
-                        sorted_difference(&vertex.incident, &other_vertex.incident)
-                    })
-                })
-                .collect::<Option<Vec<_>>>()
-            else {
-                return false;
-            };
-
-            differences.iter().all(|difference| !difference.is_empty())
-                && (0..differences.len()).all(|j| {
-                    ((j + 1)..differences.len())
-                        .all(|k| incomparable(&differences[j], &differences[k]))
-                })
-        })
-    }
-
-    pub fn connectivity_check(cert: &Certificate) -> bool {
-        let graph = &cert.neighbors;
-        if graph.is_empty() {
-            return true;
-        }
-
-        let mut visited = vec![false; graph.len()];
-        let mut queue = VecDeque::new();
-        visited[0] = true;
-        queue.push_back(0usize);
-        let mut count = 1usize;
-
-        while let Some(vertex) = queue.pop_front() {
-            let Some(neighbors) = graph.get(vertex) else {
-                return false;
-            };
-            for &neighbor in neighbors {
-                if neighbor >= graph.len() {
-                    return false;
-                }
-                if !visited[neighbor] {
-                    visited[neighbor] = true;
-                    count += 1;
-                    queue.push_back(neighbor);
-                }
-            }
-        }
-
-        count == graph.len()
     }
 
     pub fn full_dim_feasibility_check(cert: &Certificate) -> bool {
@@ -755,12 +755,6 @@ mod rocq {
             && separability_check(cert)
     }
 
-    pub fn geom_graph_check(cert: &Certificate) -> bool {
-        graph_image_check(cert)
-            && geom_edge_pairwise_check(cert)
-            && connectivity_check(cert)
-    }
-
 }
 
 fn timed_bool(name: &str, check: impl FnOnce() -> bool) -> bool {
@@ -777,11 +771,13 @@ fn check_in_memory_certificate(h: &HRep, cert: &Certificate) -> Result<()> {
         timed_bool("Well-formedness check", || rocq::well_formedness_check(cert));
     let uniqueness = timed_bool("Uniqueness check", || rocq::uniqueness_check(cert));
     let feasibility = timed_bool("Feasibility check", || rocq::feasibility_check(cert));
+    let vertexhood = timed_bool("Vertexhood flag check", || rocq::vertexhood_check(cert));
     let graph = timed_bool("Graph check", || rocq::graph_check(cert));
     let mapping = timed_bool("Mapping check", || rocq::mapping_check(cert));
     let root = timed_bool("Root check", || rocq::root_check(cert));
-    let geometric_graph =
-        timed_bool("Geometric graph check", || rocq::geom_graph_check(cert));
+    let ridge_graph_image = timed_bool("Ridge graph image check", || {
+        rocq::ridge_graph_image_check(cert)
+    });
     let full_dimension =
         timed_bool("Full dimension check", || rocq::full_dim_check(cert));
 
@@ -789,15 +785,35 @@ fn check_in_memory_certificate(h: &HRep, cert: &Certificate) -> Result<()> {
         && well_formedness
         && uniqueness
         && feasibility
+        && vertexhood
         && graph
         && mapping
         && root
-        && geometric_graph
+        && ridge_graph_image
         && full_dimension;
 
-    accepted
-        .then_some(())
-        .ok_or_else(|| anyhow!("certificate rejected"))
+    if accepted {
+        return Ok(());
+    }
+
+    let failed = [
+        ("inequality-file", inequality_file_check),
+        ("well-formedness", well_formedness),
+        ("uniqueness", uniqueness),
+        ("feasibility", feasibility),
+        ("vertexhood flag", vertexhood),
+        ("graph", graph),
+        ("mapping", mapping),
+        ("root", root),
+        ("ridge graph image", ridge_graph_image),
+        ("full dimension", full_dimension),
+    ]
+    .into_iter()
+    .filter_map(|(name, passed)| (!passed).then_some(name))
+    .collect::<Vec<_>>()
+    .join(", ");
+
+    Err(anyhow!("certificate rejected; failed checks: {failed}"))
 }
 
 /// Checks a certificate immediately after generation, without a JSON
@@ -825,12 +841,67 @@ pub fn check_certificate(ine_path: &str, certificate_path: &str) -> Result<()> {
 mod tests {
     use super::*;
 
+    fn flag_item(
+        incident: Vec<usize>,
+        local_inequalities: Vec<usize>,
+        witnesses: Vec<usize>,
+    ) -> VertexItem {
+        VertexItem {
+            incident,
+            vertex: crate::certificate::VertexCoords {
+                num: Vec::new(),
+                den: Integer::from(1),
+            },
+            flag: (local_inequalities, witnesses),
+        }
+    }
+
+    fn graph_checks_certificate() -> Certificate {
+        let items = vec![
+            flag_item(vec![0, 1, 2], Vec::new(), Vec::new()),
+            flag_item(vec![1, 2, 3], Vec::new(), Vec::new()),
+            flag_item(vec![0, 2, 4], Vec::new(), Vec::new()),
+        ];
+        let graph = crate::certificate::SimplexGraph {
+            g: vec![vec![1, 2], vec![0], vec![0]],
+            lbl: (0..3)
+                .map(|owner| crate::certificate::GraphLabel {
+                    simplex: Vec::new(),
+                    owner,
+                })
+                .collect(),
+        };
+
+        Certificate {
+            n_inequalities: 5,
+            dimension: 0,
+            inequalities: Vec::new(),
+            items,
+            graph,
+            neighbors: vec![vec![1, 2], vec![0], vec![0]],
+            geom_edge_lifts: vec![vec![(0, 1), (0, 2)], vec![(1, 0)], vec![(2, 0)]],
+            full_dim: crate::certificate::FullDimCertificate {
+                denominator: Integer::from(1),
+                point: Vec::new(),
+                directions: Vec::new(),
+                left_inverse: Vec::new(),
+            },
+            root: crate::certificate::Root {
+                simplex_id: 0,
+                inverse_incident_map: Vec::new(),
+                basis_vectors: Vec::new(),
+                m_matrix: Vec::new(),
+                q_vectors: Vec::new(),
+            },
+        }
+    }
+
     #[test]
     fn rug_dot_is_exact_for_large_signed_values() {
-        let large = Integer::from(1) << 200;
+        let large = Integer::from(1) << 200usize;
         let x = vec![large.clone(), -large.clone(), Integer::from(7)];
         let y = vec![Integer::from(3), Integer::from(5), Integer::from(-11)];
-        let mut expected = -(large << 1);
+        let mut expected = -(large << 1usize);
         expected -= 77;
         assert_eq!(dot(&x, &y), Some(expected));
     }
@@ -838,5 +909,58 @@ mod tests {
     #[test]
     fn rug_dot_rejects_different_lengths() {
         assert_eq!(dot(&[Integer::from(1)], &[]), None);
+    }
+
+    #[test]
+    fn complete_flag_resolves_inequalities_locally() {
+        // The flag [1, 0] denotes global inequalities [5, 2] in the target's
+        // active set. Witness 1 avoids 5; witness 2 saturates 5 and avoids 2.
+        let items = vec![
+            flag_item(vec![2, 5], vec![1, 0], vec![1, 2]),
+            flag_item(vec![2], Vec::new(), Vec::new()),
+            flag_item(vec![5], Vec::new(), Vec::new()),
+        ];
+
+        assert!(flag_is_well_formed(&items[0], 2, items.len()));
+        assert!(complete_flag_check(&items, &items[0], 2));
+    }
+
+    #[test]
+    fn complete_flag_rejects_bad_indices() {
+        let bad_local = flag_item(vec![2, 5], vec![2, 0], vec![1, 2]);
+        let bad_witness = flag_item(vec![2, 5], vec![1, 0], vec![1, 3]);
+
+        assert!(!flag_is_well_formed(&bad_local, 2, 3));
+        assert!(!flag_is_well_formed(&bad_witness, 2, 3));
+    }
+
+    #[test]
+    fn complete_flag_rejects_missing_prefix_incidence() {
+        let items = vec![
+            flag_item(vec![2, 5], vec![1, 0], vec![1, 2]),
+            flag_item(vec![2], Vec::new(), Vec::new()),
+            flag_item(Vec::new(), Vec::new(), Vec::new()),
+        ];
+
+        assert!(!complete_flag_check(&items, &items[0], 2));
+    }
+
+    #[test]
+    fn complete_flag_rejects_nonstrict_cut() {
+        let items = vec![
+            flag_item(vec![2, 5], vec![1, 0], vec![1, 2]),
+            flag_item(vec![2, 5], Vec::new(), Vec::new()),
+            flag_item(vec![5], Vec::new(), Vec::new()),
+        ];
+
+        assert!(!complete_flag_check(&items, &items[0], 2));
+    }
+
+    #[test]
+    fn ridge_image_check_rejects_invalid_lift() {
+        let mut bad_ridge_image = graph_checks_certificate();
+        assert!(rocq::ridge_graph_image_check(&bad_ridge_image));
+        bad_ridge_image.geom_edge_lifts[0][0] = (0, 2);
+        assert!(!rocq::ridge_graph_image_check(&bad_ridge_image));
     }
 }
