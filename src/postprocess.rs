@@ -1,6 +1,5 @@
 use anyhow::{anyhow, bail, Context, Result};
 use rug::{Complete, Integer};
-use std::cmp::Ordering;
 use std::collections::{hash_map::Entry, BTreeMap, HashMap};
 use std::fs::{self, File};
 use std::hash::{BuildHasherDefault, Hasher};
@@ -752,11 +751,12 @@ pub fn build_item_neighbors_and_lifts(
 /// `I(v)[p_k]`.
 ///
 /// The construction uses the geometric edges incident to `v`. At every
-/// level it chooses an active inequality retaining the largest proper subset
-/// of the edges in the current face. Such a subset is inclusion-maximal and
-/// therefore cuts out a facet of the current face. Repeating this operation
-/// yields a saturated flag. A neighbor discarded by the cut is the required
-/// strictness witness.
+/// level, it picks one edge in the current face and considers only the active
+/// inequalities which do not contain that edge. Among them, it chooses one
+/// retaining the largest subset of the current edges. This cuts out a facet
+/// of the current face, while the picked edge supplies the strictness
+/// witness. Repeating this operation yields both a saturated face flag and a
+/// flag-compatible basis of edge directions at `v`.
 ///
 /// Witnesses are item indices, so this construction is intended for bounded
 /// polytopes. For an unbounded face, a ray rather than another vertex may be
@@ -775,6 +775,9 @@ pub fn build_vertex_flags(
     }
 
     let mut flags = Vec::with_capacity(items.len());
+    let mut live_neighbors = Vec::new();
+    let mut candidates = Vec::new();
+    let mut missing_counts = Vec::new();
 
     for (owner, item) in items.iter().enumerate() {
         if item.incident.len() < d {
@@ -784,117 +787,112 @@ pub fn build_vertex_flags(
             );
         }
 
-        let owner_neighbors = &neighbors[owner];
-
-        // For every edge v--w, store the local positions in I(v) which are
-        // not active at w. These sparse differences are also indexed in the
-        // opposite direction, by local inequality position. This lets every
-        // edge and every missing incidence be removed only once while the
-        // flag descends through the faces.
-        let mut missing_positions = Vec::<Vec<usize>>::with_capacity(owner_neighbors.len());
-        let mut edges_missing = vec![Vec::<usize>::new(); item.incident.len()];
-        let mut missing_counts = vec![0usize; item.incident.len()];
-        for (edge_position, &neighbor) in owner_neighbors.iter().enumerate() {
+        live_neighbors.clear();
+        live_neighbors.extend_from_slice(&neighbors[owner]);
+        for &neighbor in &live_neighbors {
             if neighbor == owner {
                 bail!("geometric neighbor list of item {owner} contains itself");
             }
-            let neighbor_item = items.get(neighbor).ok_or_else(|| {
-                anyhow!(
+            if neighbor >= items.len() {
+                bail!(
                     "neighbors[{owner}] contains item {neighbor}, but there are only {} items",
                     items.len()
-                )
-            })?;
-
-            let mut missing = Vec::new();
-            let mut i = 0usize;
-            let mut j = 0usize;
-            while i < item.incident.len() {
-                if j == neighbor_item.incident.len() {
-                    missing.extend(i..item.incident.len());
-                    break;
-                }
-                match item.incident[i].cmp(&neighbor_item.incident[j]) {
-                    Ordering::Less => {
-                        missing.push(i);
-                        i += 1;
-                    }
-                    Ordering::Greater => j += 1,
-                    Ordering::Equal => {
-                        i += 1;
-                        j += 1;
-                    }
-                }
+                );
             }
-            for &incident_position in &missing {
-                edges_missing[incident_position].push(edge_position);
-                missing_counts[incident_position] += 1;
-            }
-            missing_positions.push(missing);
         }
 
-        // After k restrictions, the live edges are exactly those at v in the
-        // face defined by the first k flag inequalities. missing_counts[p]
-        // is the number of live edges excluded by local inequality p.
-        let mut alive = vec![true; owner_neighbors.len()];
-        let mut remaining = owner_neighbors.len();
+        // Reused at every level. Only the inequalities missing at the chosen
+        // witness edge are candidates for the next facet; no all-edge
+        // missing-incidence relation is materialized.
         let mut inequality_flag = Vec::with_capacity(d);
         let mut witness_flag = Vec::with_capacity(d);
 
         for level in 0..d {
-            if remaining == 0 {
-                bail!(
+            let &witness = live_neighbors.first().ok_or_else(|| {
+                anyhow!(
                     "cannot build a length-{d} flag for item {owner}: no incident geometric edge remains before level {level}; point-index witnesses require a bounded polytope"
+                )
+            })?;
+            let witness_item = &items[witness];
+
+            // Compute the local positions of I(v) \ I(witness). Both active
+            // sets are sorted, so this is a single merge scan.
+            candidates.clear();
+            let mut i = 0usize;
+            let mut j = 0usize;
+            while i < item.incident.len() {
+                if j == witness_item.incident.len() {
+                    candidates.extend(i..item.incident.len());
+                    break;
+                }
+                if item.incident[i] < witness_item.incident[j] {
+                    candidates.push(i);
+                    i += 1;
+                } else if item.incident[i] > witness_item.incident[j] {
+                    j += 1;
+                } else {
+                    i += 1;
+                    j += 1;
+                }
+            }
+            if candidates.is_empty() {
+                bail!(
+                    "cannot separate item {owner} from its geometric neighbor {witness} at flag level {level}: I({owner}) is contained in I({witness})"
                 );
             }
 
-            // A proper cut excludes a positive number of live edges.
-            // Minimizing that number maximizes the retained edge set, hence
-            // gives an inclusion-maximal proper restriction. Since incident
-            // is sorted, keeping the first minimum gives deterministic
-            // tie-breaking by the global inequality index.
-            let mut best_position = None;
-            let mut best_missing = usize::MAX;
-            for (incident_position, &count) in missing_counts.iter().enumerate() {
-                if count > 0 && count < best_missing {
-                    best_position = Some(incident_position);
-                    best_missing = count;
+            let best_position = if candidates.len() == 1 || live_neighbors.len() == 1 {
+                candidates[0]
+            } else {
+                // Count, among the live edges, those excluded by each
+                // candidate. The chosen witness contributes one to every
+                // count and therefore needs no incidence probes.
+                missing_counts.clear();
+                missing_counts.resize(candidates.len(), 1usize);
+                for &neighbor in &live_neighbors[1..] {
+                    let neighbor_incident = &items[neighbor].incident;
+                    for (candidate_index, &incident_position) in candidates.iter().enumerate() {
+                        let inequality = item.incident[incident_position];
+                        if neighbor_incident.binary_search(&inequality).is_err() {
+                            missing_counts[candidate_index] += 1;
+                        }
+                    }
                 }
-            }
 
-            let best_position = best_position.ok_or_else(|| {
-                anyhow!(
-                    "cannot strictly refine the flag of item {owner} at level {level}: every active inequality contains all current incident edges"
-                )
-            })?;
-            let witness_edge_position = edges_missing[best_position]
-                .iter()
-                .copied()
-                .find(|&edge_position| alive[edge_position])
-                .context("internal error: strict flag cut has no witness edge")?;
+                // Every candidate excludes the chosen witness. If a candidate
+                // cut were not a facet, a containing facet which also excludes
+                // the witness would remove a strict subset of its live edges.
+                // A cardinality minimum is therefore a facet cut. Candidates
+                // follow I(v)'s sorted order, so the first minimum breaks ties
+                // by global inequality index.
+                let best_candidate = missing_counts
+                    .iter()
+                    .enumerate()
+                    .min_by_key(|(_, count)| **count)
+                    .map(|(candidate_index, _)| candidate_index)
+                    .context("internal error: chosen witness yields no candidate inequality")?;
+                candidates[best_candidate]
+            };
+            let best_inequality = item.incident[best_position];
 
             // Store the position in I(v), not the corresponding global row.
             inequality_flag.push(best_position);
-            witness_flag.push(owner_neighbors[witness_edge_position]);
+            witness_flag.push(witness);
 
-            // Restrict to the selected hyperplane. Each edge dies once; when
-            // it does, remove its contribution from every missing count.
-            for &edge_position in &edges_missing[best_position] {
-                if !alive[edge_position] {
-                    continue;
-                }
-                alive[edge_position] = false;
-                remaining -= 1;
-                for &incident_position in &missing_positions[edge_position] {
-                    debug_assert!(missing_counts[incident_position] > 0);
-                    missing_counts[incident_position] -= 1;
-                }
-            }
+            // Descend to the selected facet. The remaining neighbors are
+            // exactly the incident edges contained in its hyperplane.
+            live_neighbors.retain(|&neighbor| {
+                items[neighbor]
+                    .incident
+                    .binary_search(&best_inequality)
+                    .is_ok()
+            });
         }
 
-        if remaining != 0 {
+        if !live_neighbors.is_empty() {
             bail!(
                 "length-{d} flag for item {owner} still contains {} incident geometric edges",
-                remaining
+                live_neighbors.len()
             );
         }
 
@@ -1498,8 +1496,9 @@ V#2 R#0 B#2 h=1 facets  3 4 I#2 det= 1
 
         // The global defining rows at vertex 0 are [0, 2], but the encoded
         // flag contains their local positions in I(0)=[0, 2, 4].
-        assert_eq!(flags[0].0, vec![0, 1]);
-        assert_eq!(flags[0].1, vec![2, 1]);
+        assert_eq!(flags[0].0, vec![1, 0]);
+        assert_eq!(flags[0].1, vec![1, 2]);
+        assert!(!flags[0].0.contains(&2));
 
         for (owner, (local_inequalities, witnesses)) in flags.iter().enumerate() {
             assert_eq!(local_inequalities.len(), 2);
@@ -1523,6 +1522,31 @@ V#2 R#0 B#2 h=1 facets  3 4 I#2 det= 1
         assert!(error
             .to_string()
             .contains("point-index witnesses require a bounded polytope"));
+    }
+
+    #[test]
+    fn vertex_flags_reject_a_neighbor_with_no_missing_active_inequality() {
+        let items = vec![
+            test_item(vec![0], 0, 0),
+            test_item(vec![0, 1], 1, 0),
+        ];
+        let error = build_vertex_flags(&items, &[vec![1], vec![0]], 1).unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("I(0) is contained in I(1)"));
+    }
+
+    #[test]
+    fn vertex_flags_reject_invalid_geometric_neighbors() {
+        let items = vec![test_item(vec![0], 0, 0)];
+
+        let self_loop = build_vertex_flags(&items, &[vec![0]], 1).unwrap_err();
+        assert!(self_loop.to_string().contains("contains itself"));
+
+        let out_of_range = build_vertex_flags(&items, &[vec![1]], 1).unwrap_err();
+        assert!(out_of_range
+            .to_string()
+            .contains("there are only 1 items"));
     }
 }
 
