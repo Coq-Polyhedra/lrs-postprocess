@@ -106,93 +106,50 @@ same_label_separators := array Int63
 
 ## Pipeline script
 
-The repository contains a helper script:
-
-```bash
-run-cert-pipeline.sh
-```
-
-It assumes that input and generated files are stored in `data/`.
-
-For a base name `BASE`, the script uses:
+`bench.py` drives the whole pipeline, one stage per command:
 
 ```text
-data/BASE.ine
-data/BASE.ext
-data/BASE-cert.json
-data/BASE-cert.bin
+lrs     lrsgmp BASE.ine -> BASE.ext           (wall time kept in BASE-lrs.time, the reference for ratios)
+cert    lrs-postprocess postprocess --bin     (BASE-cert.bin; per-phase timings in BASE-bin.log)
+check   the extracted checker on BASE-cert.bin (BASE-check.log; one row appended to the results table)
+run     lrs, cert and check in sequence
+clean   remove the generated files of an instance
+build   cargo build --release
 ```
 
-Generated logs are:
+Instances are selected by regular expressions matched against the complete
+basename of the `.ine` files in the data directory, so `cross3` selects
+exactly `cross3.ine` and `'cube(20|21)'` selects both cubes. A stage is
+skipped when its output is newer than its inputs and than the tool producing
+it; `--force` recomputes it. Outputs are staged in a `.tmp` file and moved
+into place on success. Timings are taken in Python, so no external `time`
+command is needed.
+
+```bash
+./bench.py build
+./bench.py run cross3
+./bench.py --force lrs 'cross(8|9|10)'
+./bench.py cert 'dual_cyclic_d1[5-8]_n.*'
+./bench.py check cube20
+./bench.py clean cross3
+```
+
+Options:
 
 ```text
-data/BASE-ext.log
-data/BASE-cert.log
-data/BASE-bin.log
+--data-dir DIR   directory of the .ine inputs and generated files (default: data)
+--lrsgmp CMD     lrs vertex enumerator (default: lrsgmp, from the PATH)
+--bin CMD        lrs-postprocess binary (default: target/release/lrs-postprocess)
+--checker CMD    extracted checker (default: homology_checker.exe, from the PATH)
+--results FILE   results table of the check stage (default: DATA_DIR/bench-results.tsv)
+--force          recompute stages whose output is fresh
 ```
 
-### Build the Rust binary
-
-```bash
-./run-cert-pipeline.sh build
-```
-
-### Generate the `.ext` file
-
-```bash
-./run-cert-pipeline.sh ext cross3
-```
-
-### Generate the JSON certificate
-
-```bash
-./run-cert-pipeline.sh cert cross3
-```
-
-### Generate the binary certificate
-
-```bash
-./run-cert-pipeline.sh bin cross3
-```
-
-### Run the whole pipeline
-
-```bash
-./run-cert-pipeline.sh all cross3
-```
-
-On several files:
-
-```bash
-./run-cert-pipeline.sh all cross_9 cross_10 cross_11 cross_12
-```
-
-### Clean generated files
-
-```bash
-./run-cert-pipeline.sh clean cross3
-```
-
-## Pipeline environment variables
-
-The script can be customized with environment variables:
-
-```text
-DATA_DIR       directory containing input/output files, default: data
-LRS_DIR        directory containing lrsgmp
-LRSGMP         full path to lrsgmp
-BIN            compiled Rust binary, default: ./target/release/lrs-postprocess
-CERT_GEN       JSON certificate command, default: "$BIN postprocess --pretty"
-BIN_CERT_GEN   binary certificate command, default: "$BIN postprocess --bin"
-```
-
-Example:
-
-```bash
-DATA_DIR=data \
-LRSGMP=/home/user/lrslib/lrsgmp \
-./run-cert-pipeline.sh all cross3
-```
+The results table is tab-separated, one row per `check` run: the lrs and
+certificate-generation wall times, the certificate construction, Rust check
+and encoding phases from `BASE-bin.log`, the loading time and the three check
+times of the extracted checker, their total and its ratio to the lrs time,
+and the verdict.
 
 ## Notes
 
