@@ -47,24 +47,6 @@ Examples:
 
 The binary certificate is intended to be loaded from Coq with `coq-binreader`.
 
-### Check a JSON certificate
-
-```bash
-./target/release/lrs-postprocess check input.ine certificate.json
-```
-
-Example:
-
-```bash
-./target/release/lrs-postprocess check data/cross3.ine data/cross3-cert.json
-```
-
-If successful, the checker prints:
-
-```text
-certificate accepted
-```
-
 ## JSON certificate format
 
 A certificate has the following shape:
@@ -147,14 +129,6 @@ Generated logs are:
 data/BASE-ext.log
 data/BASE-cert.log
 data/BASE-bin.log
-data/BASE-check.log
-data/BASE-coq.log
-```
-
-Generated Coq files are stored in:
-
-```text
-data/coq/
 ```
 
 ### Build the Rust binary
@@ -175,22 +149,10 @@ data/coq/
 ./run-cert-pipeline.sh cert cross3
 ```
 
-### Check the JSON certificate
-
-```bash
-./run-cert-pipeline.sh check cross3
-```
-
 ### Generate the binary certificate
 
 ```bash
 ./run-cert-pipeline.sh bin cross3
-```
-
-### Run the Coq/binreader smoke test
-
-```bash
-./run-cert-pipeline.sh coq cross3
 ```
 
 ### Run the whole pipeline
@@ -222,10 +184,6 @@ LRSGMP         full path to lrsgmp
 BIN            compiled Rust binary, default: ./target/release/lrs-postprocess
 CERT_GEN       JSON certificate command, default: "$BIN postprocess --pretty"
 BIN_CERT_GEN   binary certificate command, default: "$BIN postprocess --bin"
-CHECKER        checker command, default: "$BIN check"
-COQC           Coq compiler, default: coqc
-COQ_TEMPLATE   Coq template, default: coq/InspectCertificate.v.template
-COQ_DIR        generated Coq files directory, default: data/coq
 ```
 
 Example:
@@ -234,72 +192,6 @@ Example:
 DATA_DIR=data \
 LRSGMP=/home/user/lrslib/lrsgmp \
 ./run-cert-pipeline.sh all cross3
-```
-
-## Coq/binreader template
-
-A minimal template is:
-
-```coq
-Require Import PArray Uint63.
-From Bignums Require Import BigN BigZ BigQ.
-From BinReader Require Import BinReader.
-
-LoadData "__BIN_FILE__" As cert.
-
-Definition items := fst cert.
-Definition roots := snd cert.
-
-Check cert.
-Check items.
-Check roots.
-
-Eval compute in PArray.length items.
-Eval compute in PArray.length roots.
-```
-
-Save it as:
-
-```text
-coq/InspectCertificate.v.template
-```
-
-The command
-
-```bash
-./run-cert-pipeline.sh coq cross3
-```
-
-substitutes `__BIN_FILE__` with the absolute path of `data/cross3-cert.bin`, writes a generated `.v` file in `data/coq/`, and runs `coqc`.
-
-## Coq dependencies
-
-For the Coq/binreader smoke test, install:
-
-- Coq,
-- `coq-bignums`,
-- `coq-binreader`.
-
-Example:
-
-```bash
-opam install coq-bignums
-opam pin add coq-binreader https://github.com/Coq-Polyhedra/coq-binreader.git
-opam install coq-binreader
-```
-
-If using a specific opam switch:
-
-```bash
-eval "$(opam env --switch=coq-8.17 --set-switch)"
-```
-
-A quick test that the dependencies are available:
-
-```coq
-Require Import PArray Uint63.
-From Bignums Require Import BigN BigZ BigQ.
-From BinReader Require Import BinReader.
 ```
 
 ## Notes

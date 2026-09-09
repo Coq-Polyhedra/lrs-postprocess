@@ -17,9 +17,6 @@ BIN="${BIN:-./target/release/lrs-postprocess}"
 JSON_CERT_GEN="${JSON_CERT_GEN:-$BIN postprocess --pretty}"
 CERT_GEN="${CERT_GEN:-${BIN_CERT_GEN:-$BIN postprocess --bin}}"
 
-COQC="${COQC:-coqc}"
-COQ_TEMPLATE="${COQ_TEMPLATE:-coq/InspectCertificate.v.template}"
-COQ_DIR="${COQ_DIR:-${DATA_DIR}/coq}"
 LAST_ELAPSED=""
 
 format_elapsed_seconds() {
@@ -513,45 +510,6 @@ generate_binary_certificate() {
         "$ext_file"
 }
 
-run_coq_binreader_test() {
-    local base="$1"
-    local bin_file="${DATA_DIR}/${base}-cert.bin"
-
-    # Coq module names cannot contain '-' characters, so sanitize the generated
-    # .v filename. This still keeps the original basename for data/log files.
-    local coq_base="${base//-/_}"
-    local v_file="${COQ_DIR}/${coq_base}_inspect.v"
-
-    local log_file="${DATA_DIR}/${base}-coq.log"
-    local lrs_elapsed
-    lrs_elapsed="$(read_lrs_elapsed "$base")"
-
-    if [[ ! -f "$bin_file" ]]; then
-        echo "error: binary certificate not found: $bin_file" >&2
-        echo "hint: generate it with: $0 cert $base" >&2
-        exit 1
-    fi
-
-    if [[ ! -f "$COQ_TEMPLATE" ]]; then
-        echo "error: Coq template not found: $COQ_TEMPLATE" >&2
-        exit 1
-    fi
-
-    if [[ -z "$lrs_elapsed" ]]; then
-        echo "warning: missing lrs time for $base; run '$0 lrs $base' first for ratios" >&2
-    fi
-
-    mkdir -p "$COQ_DIR"
-
-    local abs_bin_file
-    abs_bin_file="$(realpath "$bin_file")"
-
-    sed "s|__BIN_FILE__|${abs_bin_file}|g" "$COQ_TEMPLATE" > "$v_file"
-
-    run_timed "Coq/binreader test for $base" "$log_file" "$lrs_elapsed" \
-        "$COQC" "$v_file"
-}
-
 clean_generated() {
     local base="$1"
 
@@ -563,10 +521,6 @@ clean_generated() {
     local ext_log="${DATA_DIR}/${base}-ext.log"
     local cert_log="${DATA_DIR}/${base}-cert.log"
     local bin_log="${DATA_DIR}/${base}-bin.log"
-    local coq_log="${DATA_DIR}/${base}-coq.log"
-
-    local coq_base="${base//-/_}"
-    local coq_file="${COQ_DIR}/${coq_base}_inspect.v"
 
     echo
     echo "=== clean generated files for $base ==="
@@ -578,9 +532,7 @@ clean_generated() {
         "$lrs_time_file" \
         "$ext_log" \
         "$cert_log" \
-        "$bin_log" \
-        "$coq_log" \
-        "$coq_file"
+        "$bin_log"
 
     echo "--- cleaned generated files for $base ---"
 }
@@ -598,9 +550,6 @@ run_one() {
             ;;
         cert|bin)
             generate_binary_certificate "$base"
-            ;;
-        rocq|coq)
-            run_coq_binreader_test "$base"
             ;;
         run|all)
             compute_ext "$base"
@@ -624,22 +573,20 @@ Usage:
   $0 build
   $0 lrs    PATTERN[.ine] [PATTERN[.ine] ...]
   $0 cert   PATTERN[.ine] [PATTERN[.ine] ...]
-  $0 rocq   PATTERN[.ine] [PATTERN[.ine] ...]
   $0 clean  PATTERN[.ine] [PATTERN[.ine] ...]
 
 The default command is 'run'. It executes the complete production pipeline:
-  lrs -> create certificate -> Rust check -> binary encoding -> Rocq check
+  lrs -> create certificate -> Rust check -> binary encoding
 
 Individual production stages:
   lrs     Generate BASE.ext with lrsgmp.
   cert    From an existing BASE.ext, create and Rust-check BASE-cert.bin.
-  rocq    Check an existing BASE-cert.bin with Rocq.
 
 JSON diagnostics (not needed by the production pipeline):
   $0 json   PATTERN[.ine] [PATTERN[.ine] ...]
 
 Compatibility aliases:
-  all = run, ext = lrs, bin = cert, coq = rocq
+  all = run, ext = lrs, bin = cert
 
 Instance selection:
   Every PATTERN is a Bash extended regular expression matched against the
@@ -660,11 +607,6 @@ Generated logs:
   ${DATA_DIR}/BASE-ext.log
   ${DATA_DIR}/BASE-cert.log
   ${DATA_DIR}/BASE-bin.log
-  ${DATA_DIR}/BASE-coq.log
-
-Generated Coq files:
-  ${COQ_DIR}/BASE_inspect.v
-  where '-' in BASE is replaced by '_'.
 
 Examples:
   $0 build
@@ -673,7 +615,6 @@ Examples:
   $0 cert cross_9 cross_10
   $0 cert 'cross(8|9|10)'
   $0 'dual_cyclic_d(1[4-9]|20)_n.*'
-  $0 rocq cross_9
   $0 json cross_12
   $0 clean cross_9 cross_10
 
@@ -685,7 +626,7 @@ Timing:
   measured lrs time; the raw timing records are also retained in BASE-bin.log.
   The reference is stored in ${DATA_DIR}/BASE-lrs.time.
   The run command uses the production path and does not generate JSON:
-  lrs -> in-memory Rust check -> binary encoding -> Rocq check.
+  lrs -> in-memory Rust check -> binary encoding.
 
 Environment variables:
   DATA_DIR       directory containing input/output files, default: data
@@ -696,9 +637,6 @@ Environment variables:
   CERT_GEN       binary certificate command, default: "\$BIN postprocess --bin"
   JSON_CERT_GEN  diagnostic JSON command, default: "\$BIN postprocess --pretty"
   BIN_CERT_GEN   deprecated fallback name for CERT_GEN
-  COQC           Coq compiler, default: coqc
-  COQ_TEMPLATE   Coq template, default: coq/InspectCertificate.v.template
-  COQ_DIR        generated Coq files directory, default: data/coq
 EOF
 }
 
@@ -791,7 +729,7 @@ case "$cmd" in
         fi
         build_tools
         ;;
-    run|all|lrs|ext|cert|bin|rocq|coq|json|clean)
+    run|all|lrs|ext|cert|bin|json|clean)
         if [[ $# -lt 1 ]]; then
             echo "error: expected at least one instance pattern" >&2
             usage
