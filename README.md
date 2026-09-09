@@ -1,14 +1,19 @@
 # lrs-postprocess
 
-`lrs-postprocess` builds and checks certificates from `lrslib` output. It can also export certificates in a binary format readable from Coq using [`coq-binreader`](https://github.com/Coq-Polyhedra/coq-binreader).
+`lrs-postprocess` builds and checks certificates from `lrslib` output. It can
+also export certificates in a binary format readable from Coq using
+[`coq-binreader`](https://github.com/Coq-Polyhedra/coq-binreader).
 
-The tool trusts the `lrs` enumeration output. Vertex coordinates and rational numbers are kept as strings in the JSON certificate.
+The tool trusts the `lrs` enumeration output. Vertex coordinates and rational
+numbers are kept as strings in the JSON certificate.
 
 ## Build
 
 ```bash
-cargo build --release
+make
 ```
+
+`make test` runs the unit tests and `make clean` removes the build directory.
 
 The binary is then:
 
@@ -69,11 +74,13 @@ A certificate has the following shape:
 }
 ```
 
-Each simplex is expressed using local indices into the corresponding `incident` list.
+Each simplex is expressed using local indices into the corresponding
+`incident` list.
 
 ## Binary certificate format
 
-The binary certificate stores the same data as the JSON certificate, encoded for `coq-binreader`.
+The binary certificate stores the same data as the JSON certificate, encoded
+for `coq-binreader`.
 
 The schema is:
 
@@ -109,10 +116,10 @@ same_label_separators := array Int63
 `bench.py` drives the whole pipeline, one stage per command:
 
 ```text
-lrs     lrsgmp BASE.ine -> BASE.ext           (wall time kept in BASE-lrs.time, the reference for ratios)
-cert    lrs-postprocess postprocess --bin     (BASE-cert.bin; per-phase timings in BASE-bin.log)
-check   the extracted checker on BASE-cert.bin (BASE-check.log; one row appended to the results table)
-run     lrs, cert and check in sequence
+lrs     lrsgmp BASE.ine -> BASE.ext
+cert    lrs-postprocess postprocess --bin -> BASE-cert.bin
+run     lrs and cert in sequence
+report  tabulate the measurements of the selected instances (TSV)
 clean   remove the generated files of an instance
 build   cargo build --release
 ```
@@ -122,15 +129,23 @@ basename of the `.ine` files in the data directory, so `cross3` selects
 exactly `cross3.ine` and `'cube(20|21)'` selects both cubes. A stage is
 skipped when its output is newer than its inputs and than the tool producing
 it; `--force` recomputes it. Outputs are staged in a `.tmp` file and moved
-into place on success. Timings are taken in Python, so no external `time`
-command is needed.
+into place on success.
+
+Both stages write what they measured to `BASE-<stage>-timings.json`: the
+wall-clock time and the peak memory of the process, measured in Python, plus,
+for `cert`, the wall-clock phase timings reported by `lrs-postprocess` itself
+(certificate construction, Rust check, encoding). The tool's raw output is
+kept in `BASE-<stage>.log`. `report` builds a tab-separated table from these
+records, one row per instance with blank cells for stages that have not run,
+and writes it to standard output or to `-o FILE`. Its columns are the lrs and
+certificate-generation wall times and the three phases.
 
 ```bash
 ./bench.py build
 ./bench.py run cross3
 ./bench.py --force lrs 'cross(8|9|10)'
 ./bench.py cert 'dual_cyclic_d1[5-8]_n.*'
-./bench.py check cube20
+./bench.py report -o results.tsv
 ./bench.py clean cross3
 ```
 
@@ -140,17 +155,12 @@ Options:
 --data-dir DIR   directory of the .ine inputs and generated files (default: data)
 --lrsgmp CMD     lrs vertex enumerator (default: lrsgmp, from the PATH)
 --bin CMD        lrs-postprocess binary (default: target/release/lrs-postprocess)
---checker CMD    extracted checker (default: homology_checker.exe, from the PATH)
---results FILE   results table of the check stage (default: DATA_DIR/bench-results.tsv)
+-o FILE          report: write the table to FILE instead of standard output
 --force          recompute stages whose output is fresh
 ```
 
-The results table is tab-separated, one row per `check` run: the lrs and
-certificate-generation wall times, the certificate construction, Rust check
-and encoding phases from `BASE-bin.log`, the loading time and the three check
-times of the extracted checker, their total and its ratio to the lrs time,
-and the verdict.
-
 ## Notes
 
-The checker verifies the consistency of the certificate with the input H-representation and the generated certificate data. The binary export is intended as a compact format for importing the same certificate data into Coq.
+The checker verifies the consistency of the certificate with the input
+H-representation and the generated certificate data. The binary export is
+intended as a compact format for importing the same certificate data into Coq.
