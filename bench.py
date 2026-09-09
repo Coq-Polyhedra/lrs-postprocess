@@ -305,7 +305,7 @@ def stage_check(cfg, base):
         status = t.wait(proc)
     write_record(cfg, base, "check", t, phases=phases, verdicts=verdicts, status=status,
                  accepted=status == 0)
-    total = sum(phases.get(p, 0.0) for p in CHECKER_PHASES)
+    total = sum(phases.get(p, 0.0) for p in CHECKS)
     say(f"    checker total {with_ratio(total, lrs_s)}"
         f" [{'accepted' if status == 0 else f'REJECTED(rc={status})'}]")
     say(summary("check", t))
