@@ -118,7 +118,9 @@ same_label_separators := array Int63
 ```text
 lrs     lrsgmp BASE.ine -> BASE.ext
 cert    lrs-postprocess postprocess --bin -> BASE-cert.bin
-run     lrs and cert in sequence
+check   the extracted checker on BASE-cert.bin
+rocq    the checker run by vm_compute inside Rocq on BASE-cert.bin
+run     lrs, cert and check in sequence
 report  tabulate the measurements of the selected instances (TSV)
 clean   remove the generated files of an instance
 build   cargo build --release
@@ -131,21 +133,34 @@ skipped when its output is newer than its inputs and than the tool producing
 it; `--force` recomputes it. Outputs are staged in a `.tmp` file and moved
 into place on success.
 
-Both stages write what they measured to `BASE-<stage>-timings.json`: the
-wall-clock time and the peak memory of the process, measured in Python, plus,
-for `cert`, the wall-clock phase timings reported by `lrs-postprocess` itself
-(certificate construction, Rust check, encoding). The tool's raw output is
-kept in `BASE-<stage>.log`. `report` builds a tab-separated table from these
-records, one row per instance with blank cells for stages that have not run,
-and writes it to standard output or to `-o FILE`. Its columns are the lrs and
-certificate-generation wall times and the three phases.
+Every stage writes what it measured to `BASE-<stage>-timings.json`: the
+wall-clock time and the peak memory of the process, measured in Python, plus
+the wall-clock phase timings reported by the tool itself (certificate
+construction, Rust check and encoding for `cert`; loading and the three checks
+for `check`; loading, decoding and the three checks for `rocq`, from Rocq's
+`Time`). The tool's raw output is kept in `BASE-<stage>.log`. `report` builds
+a tab-separated table from these records, one row per instance with blank
+cells for stages that have not run, and writes it to standard output or to `-o
+FILE`. Its columns are the lrs and certificate-generation wall times, the
+three generation phases, and for each of the two checkers its loading time
+(plus decoding for Rocq), the cumulative check times T1-T5 (vertex
+containment), T1-T6 (plus vertex equality) and T1-T7 (plus graph equality),
+and the verdict. With `--relative` every time but the lrs one is divided by
+the instance's lrs time. The `rocq` stage instantiates `src/CheckCert.v.in`
+from the checker development with the certificate path and runs it through
+`coqtop -batch`; each Rocq check decodes the certificate itself, so the
+decoding time is included in each of the three check times and is also
+reported on its own.
 
 ```bash
 ./bench.py build
 ./bench.py run cross3
 ./bench.py --force lrs 'cross(8|9|10)'
 ./bench.py cert 'dual_cyclic_d1[5-8]_n.*'
+./bench.py check cube20
+./bench.py rocq cube15
 ./bench.py report -o results.tsv
+./bench.py report --relative 'cube.*'
 ./bench.py clean cross3
 ```
 
@@ -155,6 +170,11 @@ Options:
 --data-dir DIR   directory of the .ine inputs and generated files (default: data)
 --lrsgmp CMD     lrs vertex enumerator (default: lrsgmp, from the PATH)
 --bin CMD        lrs-postprocess binary (default: target/release/lrs-postprocess)
+--checker CMD    extracted checker (default: homology_checker.exe, from the PATH)
+--rocq-dir DIR   checker development with src/CheckCert.v.in and its compiled
+                 modules (default: ../homology-checker)
+--coqtop CMD     Rocq toplevel (default: coqtop, from the PATH)
+--rocq-timeout S kill a Rocq check after S seconds (default: 3600)
 -o FILE          report: write the table to FILE instead of standard output
 --force          recompute stages whose output is fresh
 ```
