@@ -1,7 +1,6 @@
-use anyhow::{Context, Result};
+use anyhow::Result;
 use rug::Integer;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
-use std::fs;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Certificate {
@@ -214,15 +213,6 @@ mod sparse_decimal_vectors {
             })
             .collect()
     }
-}
-
-/// Reads JSON while decoding decimal strings directly into GMP integers.
-pub fn read_certificate(path: &str) -> Result<Certificate> {
-    let text =
-        fs::read_to_string(path).with_context(|| format!("failed to read certificate `{path}`"))?;
-
-    serde_json::from_str(&text)
-        .with_context(|| format!("failed to parse certificate JSON and integers `{path}`"))
 }
 
 pub fn certificate_to_string(cert: &Certificate, pretty: bool) -> Result<String> {

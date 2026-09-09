@@ -10,7 +10,7 @@ mod postprocess;
 
 use binencode::write_certificate_bin;
 use certificate::{certificate_to_string, Certificate};
-use checker::{check_certificate, check_generated_certificate};
+use checker::check_generated_certificate;
 use postprocess::{
     build_full_dim_certificate, build_item_neighbors_and_lifts,
     build_simplex_graph, build_vertex_flags, certificate_inequalities,
@@ -20,7 +20,6 @@ use postprocess::{
 #[derive(Debug, Clone)]
 enum Command {
     Postprocess(PostprocessArgs),
-    Check(CheckArgs),
 }
 
 #[derive(Debug, Clone)]
@@ -32,17 +31,10 @@ struct PostprocessArgs {
     k0: Option<usize>,
 }
 
-#[derive(Debug, Clone)]
-struct CheckArgs {
-    ine_path: String,
-    certificate_path: String,
-}
-
 fn print_help(program: &str) {
     eprintln!(
         "Usage:
   {program} postprocess input.ine output.ext [OPTIONS]
-  {program} check input.ine certificate.json
 
 Postprocess options:
   --pretty          Pretty-print JSON output
@@ -57,7 +49,6 @@ Examples:
   {program} postprocess cross3.ine cross3.ext --pretty
   {program} postprocess cross3.ine cross3.ext --bin > cross3-cert.bin
   {program} postprocess cross3.ine cross3.ext --pretty --k0 0
-  {program} check cross3.ine certificate.json
 
 Backward-compatible shorthand:
   {program} input.ine output.ext [OPTIONS]
@@ -141,43 +132,6 @@ where
     }))
 }
 
-fn parse_check_args<I>(program: &str, mut it: I) -> Result<Command>
-where
-    I: Iterator<Item = String>,
-{
-    let mut positional: Vec<String> = Vec::new();
-
-    while let Some(arg) = it.next() {
-        match arg.as_str() {
-            "-h" | "--help" => {
-                print_help(program);
-                std::process::exit(0);
-            }
-
-            _ if arg.starts_with('-') => {
-                bail!("unknown option `{arg}`; use --help for usage");
-            }
-
-            _ => {
-                positional.push(arg);
-            }
-        }
-    }
-
-    if positional.len() != 2 {
-        print_help(program);
-        bail!(
-            "check expects exactly 2 positional arguments: input.ine and certificate.json; got {}",
-            positional.len()
-        );
-    }
-
-    Ok(Command::Check(CheckArgs {
-        ine_path: positional[0].clone(),
-        certificate_path: positional[1].clone(),
-    }))
-}
-
 fn parse_args() -> Result<Command> {
     let mut it = std::env::args();
     let program = it.next().unwrap_or_else(|| "lrs-postprocess".to_string());
@@ -194,8 +148,6 @@ fn parse_args() -> Result<Command> {
         }
 
         "postprocess" => parse_postprocess_args(&program, it, None),
-
-        "check" => parse_check_args(&program, it),
 
         // Backward-compatible shorthand:
         //   program input.ine output.ext [OPTIONS]
@@ -382,15 +334,8 @@ fn run_postprocess(args: PostprocessArgs) -> Result<()> {
     Ok(())
 }
 
-fn run_check(args: CheckArgs) -> Result<()> {
-    check_certificate(&args.ine_path, &args.certificate_path)?;
-    println!("certificate accepted");
-    Ok(())
-}
-
 fn main() -> Result<()> {
     match parse_args()? {
         Command::Postprocess(args) => run_postprocess(args),
-        Command::Check(args) => run_check(args),
     }
 }

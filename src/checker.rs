@@ -1,9 +1,9 @@
-use anyhow::{anyhow, Context, Result};
+use anyhow::{anyhow, Result};
 use rug::{Complete, Integer};
 use std::time::Instant;
 
-use crate::certificate::{read_certificate, Certificate, Inequality, VertexItem};
-use crate::postprocess::{parse_lrs_hrep, HRep};
+use crate::certificate::{Certificate, Inequality, VertexItem};
+use crate::postprocess::HRep;
 
 fn has_matrix_shape<T>(matrix: &[Vec<T>], rows: usize, columns: usize) -> bool {
     matrix.len() == rows && matrix.iter().all(|row| row.len() == columns)
@@ -820,21 +820,6 @@ fn check_in_memory_certificate(h: &HRep, cert: &Certificate) -> Result<()> {
 /// serialization/write/read/parse round trip.
 pub fn check_generated_certificate(h: &HRep, cert: &Certificate) -> Result<()> {
     check_in_memory_certificate(h, cert)
-}
-
-pub fn check_certificate(ine_path: &str, certificate_path: &str) -> Result<()> {
-    let start = Instant::now();
-    let h = parse_lrs_hrep(ine_path).context("failed to parse H-representation")?;
-    eprintln!(
-        "Parse H-representation: {:.6} s",
-        start.elapsed().as_secs_f64()
-    );
-
-    let start = Instant::now();
-    let cert = read_certificate(certificate_path)?;
-    eprintln!("Read certificate: {:.6} s", start.elapsed().as_secs_f64());
-
-    check_in_memory_certificate(&h, &cert)
 }
 
 #[cfg(test)]
