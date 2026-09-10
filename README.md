@@ -1,8 +1,9 @@
 # lrs-postprocess
 
-`lrs-postprocess` builds and checks certificates from `lrslib` output. It can
-also export certificates in a binary format readable from Coq using
-[`coq-binreader`](https://github.com/Coq-Polyhedra/coq-binreader).
+`lrs-postprocess` builds certificates from `lrslib` output and exports them
+in a binary format readable from Coq using
+[`coq-binreader`](https://github.com/Coq-Polyhedra/coq-binreader). The
+certificates are checked by the verified checker of `homology-checker`.
 
 The tool trusts the `lrs` enumeration output. Vertex coordinates and rational
 numbers are kept as strings in the JSON certificate.
@@ -34,6 +35,8 @@ Options:
 ```text
 --pretty       Pretty-print JSON output
 --k0 INDEX     Choose the root vertex item index, 0-based
+--source INDEX Source vertex of the distance certificate, as a 0-based position
+               in the lexicographic order of the vertex coordinates (default 0)
 --bin          Output the certificate in binary format for coq-binreader
 ```
 
@@ -117,7 +120,8 @@ same_label_separators := array Int63
 
 ```text
 lrs     lrsgmp BASE.ine -> BASE.ext
-cert    lrs-postprocess postprocess --bin -> BASE-cert.bin
+cert    lrs-postprocess postprocess --bin -> BASE-cert.bin (the source vertex
+        of the distance certificate is read from the sources file)
 check   the extracted checker on BASE-cert.bin
 rocq    the checker run by vm_compute inside Rocq on BASE-cert.bin
 run     lrs, cert and check in sequence
@@ -136,8 +140,8 @@ into place on success.
 Every stage writes what it measured to `BASE-<stage>-timings.json`: the
 wall-clock time and the peak memory of the process, measured in Python, plus
 the wall-clock phase timings reported by the tool itself (certificate
-construction, Rust check and encoding for `cert`; loading and the three checks
-for `check`; loading, decoding and the three checks for `rocq`, from Rocq's
+construction and encoding for `cert`; loading and the three checks for
+`check`; loading, decoding and the three checks for `rocq`, from Rocq's
 `Time`). The tool's raw output is kept in `BASE-<stage>.log`. `report` builds
 a tab-separated table from these records, one row per instance with blank
 cells for stages that have not run, and writes it to standard output or to `-o
@@ -145,12 +149,13 @@ FILE`. Its columns are the lrs and certificate-generation wall times, the
 three generation phases, and for each of the two checkers its loading time
 (plus decoding for Rocq), the cumulative check times T1-T5 (vertex
 containment), T1-T6 (plus vertex equality) and T1-T7 (plus graph equality),
-and the verdict. With `--relative` every time but the lrs one is divided by
-the instance's lrs time. The `rocq` stage instantiates `src/CheckCert.v.in`
-from the checker development with the certificate path and runs it through
-`coqtop -batch`; each Rocq check decodes the certificate itself, so the
-decoding time is included in each of the three check times and is also
-reported on its own.
+the verdict, and, for the instances with a distance certificate, the certified
+eccentricity of its source vertex with its time (`ecc`, `ecc_s`). With
+`--relative` every time but the lrs one is divided by the instance's lrs time.
+The `rocq` stage instantiates `src/CheckCert.v.in` from the checker
+development with the certificate path and runs it through `coqtop -batch`;
+each Rocq check decodes the certificate itself, so the decoding time is
+included in each of the three check times and is also reported on its own.
 
 ```bash
 ./bench.py build
@@ -175,12 +180,15 @@ Options:
                  modules (default: ../homology-checker)
 --coqtop CMD     Rocq toplevel (default: coqtop, from the PATH)
 --rocq-timeout S kill a Rocq check after S seconds (default: 3600)
+--sources FILE   JSON object mapping instances to the source vertex of their
+                 distance certificate, a position in the coordinate order of
+                 the vertices (default: data/sources.json; others use 0)
 -o FILE          report: write the table to FILE instead of standard output
 --force          recompute stages whose output is fresh
 ```
 
 ## Notes
 
-The checker verifies the consistency of the certificate with the input
-H-representation and the generated certificate data. The binary export is
-intended as a compact format for importing the same certificate data into Coq.
+The tool performs no check of its own: the certificate it writes is validated
+by the verified checker (extracted to OCaml, or run inside Rocq), which is
+where any inconsistency with the input H-representation is detected.

@@ -4,7 +4,9 @@
 Stages, per instance BASE (a BASE.ine file in the data directory):
 
   lrs     lrsgmp BASE.ine -> BASE.ext
-  cert    lrs-postprocess postprocess --bin -> BASE-cert.bin
+  cert    lrs-postprocess postprocess --bin -> BASE-cert.bin, plus the
+          distance certificate BASE-dist.bin for the instances listed in
+          the sources file
   check   the extracted checker on BASE-cert.bin
   rocq    the checker run by vm_compute inside Rocq on BASE-cert.bin
   run     lrs, cert and check in sequence
@@ -14,8 +16,8 @@ Stages, per instance BASE (a BASE.ine file in the data directory):
 
 Every stage records what it measured in BASE-<stage>-timings.json: the
 wall-clock time and the peak memory of the process, plus the wall-clock
-phase timings the tool itself reports (certificate construction, Rust check
-and encoding for cert; loading and the three checks for check; loading,
+phase timings the tool itself reports (certificate construction and
+encoding for cert; loading and the three checks for check; loading,
 decoding and the three checks for rocq). Rerunning a stage replaces its
 record. The tools' raw output is kept in BASE-<stage>.log.
 The report is built from the records alone, one row per instance, and never
@@ -32,11 +34,11 @@ basename of the .ine files, e.g. 'cube(20|21)' or 'dual_cyclic_d1[5-8]_n.*'.
 """
 
 import argparse
+import contextlib
 import datetime
 import json
 import os
 import re
-import resource
 import shutil
 import subprocess
 import sys
@@ -50,11 +52,14 @@ HERE = Path(__file__).resolve().parent
 TIMING_RECORD = re.compile(r"^(?P<label>.*): (?P<secs>[0-9]+(?:\.[0-9]+)?) s$")
 # Stderr records of the extracted checker, "<label>  <seconds> s [<verdict>]".
 CHECKER_RECORD = re.compile(r"^(?P<label>.*?)\s+(?P<secs>[0-9]+(?:\.[0-9]+)?) s(?:\s+(?P<verdict>\S+))?$")
+# The checker's eccentricity line carries the value in place of a verdict; the
+# Rocq run prints it as "= Some <n>" or "= None".
+ECCENTRICITY = "eccentricity"
 # Rocq's `Time` output, "Finished transaction in <wall> secs (<user>u,<sys>s) ...".
 ROCQ_TIME = re.compile(r"^Finished transaction in (?P<secs>[0-9]+\.?[0-9]*) secs")
 # The template's labels, printed before each timed command, and its `Eval` results.
 ROCQ_LABEL = re.compile(r"^(?P<label>[a-z ]+):$")
-ROCQ_RESULT = re.compile(r"^\s*= (?P<verdict>true|false)$")
+ROCQ_RESULT = re.compile(r"^\s*= (?P<verdict>true|false|None|Some (?:0x[0-9a-f]+|[0-9]+))")
 
 # Report columns: (header, stage, phases summed). A single phase is the tool's
 # own timing of that phase; None is the wall time of the whole process. The
@@ -65,17 +70,18 @@ CHECKS = ["vertex containment", "vertex equality", "graph equality"]
 REPORT_COLUMNS = [
     ("cert", "cert", [None]),
     ("cert_build", "cert", ["Create certificate in memory"]),
-    ("rust_check", "cert", ["Check certificate"]),
     ("cert_write", "cert", ["Generate and write binary certificate"]),
     ("load", "check", ["certificate loading"]),
     ("T1-T5", "check", CHECKS[:1]),
     ("T1-T6", "check", CHECKS[:2]),
     ("T1-T7", "check", CHECKS[:3]),
+    ("ecc", "check", [ECCENTRICITY]),
     ("rocq_load", "rocq", ["certificate loading"]),
     ("rocq_decode", "rocq", ["certificate decoding"]),
     ("rocq_T1-T5", "rocq", CHECKS[:1]),
     ("rocq_T1-T6", "rocq", CHECKS[:2]),
     ("rocq_T1-T7", "rocq", CHECKS[:3]),
+    ("rocq_ecc", "rocq", [ECCENTRICITY]),
 ]
 
 
@@ -92,11 +98,13 @@ class Config:
         self.rocq_dir = Path(args.rocq_dir).resolve()
         self.coqtop = tool_path(args.coqtop)
         self.rocq_timeout = args.rocq_timeout
+        self.sources = Path(args.sources).resolve()
         self.force = args.force
 
     def ine(self, base): return self.data / f"{base}.ine"
     def ext(self, base): return self.data / f"{base}.ext"
     def cert(self, base): return self.data / f"{base}-cert.bin"
+    def dist(self, base): return self.data / f"{base}-dist.bin"
     def log(self, base, stage): return self.data / f"{base}-{stage}.log"
     def record(self, base, stage): return self.data / f"{base}-{stage}-timings.json"
 
@@ -243,43 +251,56 @@ def stage_lrs(cfg, base):
 def stage_cert(cfg, base):
     ine, ext, cert = cfg.ine(base), cfg.ext(base), cfg.cert(base)
     require(ext, ".ext file (run the lrs stage first)")
-    if not cfg.force and fresh(cert, ine, ext, cfg.bin) and read_record(cfg, base, "cert"):
+    source = source_vertex(cfg, base)
+    dist = cfg.dist(base) if source is not None else None
+    if (not cfg.force and fresh(cert, ine, ext, cfg.bin) and read_record(cfg, base, "cert")
+            and (dist is None or fresh(dist, ine, ext, cfg.bin))):
         say(f"--- cert: reusing {cert.name} ({read_record(cfg, base, 'cert')['wall_s']:.3f} s)")
         return
     require_tool(cfg.bin, "lrs-postprocess binary")
     lrs_s = reference(cfg, base)
-    phases, accepted = {}, False
+    phases = {}
 
     def on_line(line):
-        nonlocal accepted
         m = TIMING_RECORD.match(line)
         if m:
             phases[m["label"]] = float(m["secs"])
             say(f"    {m['label'] + ':':<54}{with_ratio(float(m['secs']), lrs_s)}")
-        elif line == "Generated certificate accepted":
-            accepted = True
         else:
             say(f"    {line}")
 
-    say(f"--- cert: {ext.name} -> {cert.name}")
+    say(f"--- cert: {ext.name} -> {cert.name}" + (f" + {dist.name}" if dist else ""))
     with Staged(cert) as tmp, open(tmp, "wb") as out, open(cfg.log(base, "cert"), "w") as log, \
-            Timed() as t:
-        proc = subprocess.Popen([str(cfg.bin), "postprocess", "--bin", str(ine), str(ext)],
+            Staged(dist) if dist else contextlib.nullcontext() as dist_tmp, Timed() as t:
+        options = ["--source", str(source), "--distances", str(dist_tmp)] if dist else []
+        proc = subprocess.Popen([str(cfg.bin), "postprocess", "--bin", *options, str(ine), str(ext)],
                                 stdout=out, stderr=subprocess.PIPE, text=True)
         stream(proc, log, on_line)
         status = t.wait(proc)
         if status != 0:
             raise StageFailed(f"lrs-postprocess failed with status {status} (see {cfg.log(base, 'cert')})")
-        if not accepted:
-            raise StageFailed("the Rust check did not report acceptance")
-    write_record(cfg, base, "cert", t, phases=phases)
+    write_record(cfg, base, "cert", t, phases=phases, source=source)
     say(summary("cert", t))
+
+
+def source_vertex(cfg, base):
+    """The source of BASE's distance certificate, as a position in the
+    coordinate order of its vertices: the entry of the sources file, or None
+    when the instance is not listed (no distance certificate)."""
+    try:
+        source = json.loads(cfg.sources.read_text()).get(base)
+    except OSError:
+        return None
+    except (ValueError, AttributeError) as e:
+        raise StageFailed(f"unreadable sources file {cfg.sources}: {e}")
+    return None if source is None else int(source)
 
 
 def stage_check(cfg, base):
     cert, record = cfg.cert(base), cfg.record(base, "check")
     require(cert, "certificate (run the cert stage first)")
-    if not cfg.force and fresh(record, cert, cfg.checker):
+    dist = cfg.dist(base) if cfg.dist(base).exists() else None
+    if not cfg.force and fresh(record, cert, cfg.checker, *([dist] if dist else [])):
         say(f"--- check: reusing {record.name} ({read_record(cfg, base, 'check')['wall_s']:.3f} s)")
         return
     require_tool(cfg.checker, "extracted checker")
@@ -297,10 +318,10 @@ def stage_check(cfg, base):
         else:
             say(f"    {line}")
 
-    say(f"--- check: {cfg.checker.name} {cert.name}")
+    say(f"--- check: {cfg.checker.name} {cert.name}" + (f" {dist.name}" if dist else ""))
     with open(cfg.log(base, "check"), "w") as log, Timed() as t:
-        proc = subprocess.Popen([str(cfg.checker), str(cert)], stdout=subprocess.DEVNULL,
-                                stderr=subprocess.PIPE, text=True)
+        proc = subprocess.Popen([str(cfg.checker), str(cert), *([str(dist)] if dist else [])],
+                                stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True)
         stream(proc, log, on_line)
         status = t.wait(proc)
     write_record(cfg, base, "check", t, phases=phases, verdicts=verdicts, status=status,
@@ -319,7 +340,8 @@ def stage_rocq(cfg, base):
     template = cfg.rocq_dir / "src" / "CheckCert.v.in"
     require(template, "Rocq check template")
     checker_vos = [cfg.rocq_dir / "src" / f"{m}.vo" for m in ("LowLevelChecker", "CertificateSchema")]
-    if not cfg.force and fresh(record, cert, template, *checker_vos):
+    dist = cfg.dist(base) if cfg.dist(base).exists() else None
+    if not cfg.force and fresh(record, cert, template, *checker_vos, *([dist] if dist else [])):
         say(f"--- rocq: reusing {record.name} ({read_record(cfg, base, 'rocq')['wall_s']:.3f} s)")
         return
     require_tool(cfg.coqtop, "coqtop")
@@ -337,13 +359,21 @@ def stage_rocq(cfg, base):
             say(f"    {label + ':':<54}{with_ratio(phases[label], lrs_s)}"
                 + (f"  {verdicts[label]}" if label in verdicts else ""))
         elif (m := ROCQ_RESULT.match(line)) and label:
-            verdicts[label] = m["verdict"]
+            verdict = m["verdict"]
+            if verdict.startswith("Some "):
+                verdict = str(int(verdict.removeprefix("Some "), 0))  # Rocq prints int63 in hex
+            verdicts[label] = verdict.replace("None", "none")
         elif line.startswith(("Error", "Anomaly", "Toplevel input")):
             say(f"    {line}")
 
     say(f"--- rocq: {cfg.coqtop.name} on {cert.name}")
     script = cfg.data / f"{base}-rocq.v"
-    script.write_text(template.read_text().replace("@CERT@", str(cert)))
+    text = template.read_text().replace("@CERT@", str(cert))
+    if dist:
+        text = text.replace("@DIST@", str(dist))
+    else:
+        text = re.sub(r"\(\* BEGIN DISTANCES \*\).*?\(\* END DISTANCES \*\)\n", "", text, flags=re.S)
+    script.write_text(text)
     with open(cfg.log(base, "rocq"), "w") as log, Timed() as t:
         proc = subprocess.Popen([str(cfg.coqtop), "-batch", "-Q", str(cfg.rocq_dir / "src"), "Cert",
                                  "-l", str(script)], stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
@@ -356,7 +386,8 @@ def stage_rocq(cfg, base):
         timed_out = not watchdog.is_alive()
         watchdog.cancel()
     script.unlink(missing_ok=True)
-    accepted = status == 0 and all(verdicts.get(c) == "true" for c in CHECKS)
+    accepted = (status == 0 and all(verdicts.get(c) == "true" for c in CHECKS)
+                and (dist is None or verdicts.get(ECCENTRICITY, "none") != "none"))
     write_record(cfg, base, "rocq", t, phases=phases, verdicts=verdicts, status=status,
                  accepted=accepted, timed_out=timed_out)
     total = sum(phases.get(c, 0.0) for c in CHECKS)
@@ -370,7 +401,7 @@ def stage_rocq(cfg, base):
 
 def stage_clean(cfg, base):
     removed = []
-    paths = [cfg.ext(base), cfg.cert(base)]
+    paths = [cfg.ext(base), cfg.cert(base), cfg.dist(base)]
     paths += [cfg.log(base, s) for s in ("lrs", "cert", "check", "rocq")]
     paths += [cfg.record(base, s) for s in ("lrs", "cert", "check", "rocq")]
     paths.append(cfg.data / f"{base}-rocq.v")
@@ -411,6 +442,9 @@ def report(cfg, bases, out, relative):
         header.append(name + unit)
         if name in ("T1-T7", "rocq_T1-T7"):
             header.append("verdict" if stage == "check" else "rocq_verdict")
+        if name in ("ecc", "rocq_ecc"):
+            header[-1] = name + "_s"
+            header.append(name)
     out.write("\t".join(header) + "\n")
     for base in bases:
         records = {stage: read_record(cfg, base, stage) for stage in ("lrs", "cert", "check", "rocq")}
@@ -424,14 +458,18 @@ def report(cfg, bases, out, relative):
                 value = None
             elif phases == [None]:
                 value = record["wall_s"]
-            else:
+            elif any(p in record["phases"] for p in phases):
                 value = sum(record["phases"].get(p, 0.0) for p in phases)
+            else:
+                value = None
             if relative and value is not None:
                 value = value / lrs_s if lrs_s else None
             row.append(value)
             if name in ("T1-T7", "rocq_T1-T7"):
                 row.append(None if record is None else
                            "accepted" if record["accepted"] else f"REJECTED(rc={record['status']})")
+            if name in ("ecc", "rocq_ecc"):
+                row.append(None if record is None else record.get("verdicts", {}).get(ECCENTRICITY))
         out.write("\t".join("" if v is None else v if isinstance(v, str) else f"{v:.6f}" for v in row) + "\n")
 
 
@@ -481,6 +519,10 @@ def main():
                         help="Rocq toplevel (default: coqtop, from the PATH)")
     parser.add_argument("--rocq-timeout", type=float, default=3600, metavar="SECS",
                         help="kill a Rocq check after this long (default: 3600)")
+    parser.add_argument("--sources", default="data/sources.json", metavar="FILE",
+                        help="JSON object mapping instances to the source vertex of their distance "
+                             "certificate, a position in the coordinate order of the vertices "
+                             "(default: data/sources.json; instances not listed use 0)")
     parser.add_argument("-o", "--output", metavar="FILE",
                         help="report: write the table to FILE instead of standard output")
     parser.add_argument("--relative", action="store_true",
