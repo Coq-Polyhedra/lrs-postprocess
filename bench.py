@@ -7,8 +7,8 @@ Stages, per instance BASE (a BASE.ine file in the data directory):
   cert    lrs-postprocess postprocess --bin -> BASE-cert.bin, plus the
           distance certificate BASE-dist.bin for the instances listed in
           the sources file
-  check   the extracted checker on BASE-cert.bin
-  rocq    the checker run by vm_compute inside Rocq on BASE-cert.bin
+  check   the extracted checker on BASE-cert.bin (and BASE-dist.bin if present)
+  rocq    the same check run by vm_compute inside Rocq
   run     lrs, cert and check in sequence
   report  tabulate the measurements of the selected instances (TSV)
   clean   remove every generated file of the instance

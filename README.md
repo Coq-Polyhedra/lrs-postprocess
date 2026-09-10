@@ -122,8 +122,8 @@ same_label_separators := array Int63
 lrs     lrsgmp BASE.ine -> BASE.ext
 cert    lrs-postprocess postprocess --bin -> BASE-cert.bin (the source vertex
         of the distance certificate is read from the sources file)
-check   the extracted checker on BASE-cert.bin
-rocq    the checker run by vm_compute inside Rocq on BASE-cert.bin
+check   the extracted checker on BASE-cert.bin (and BASE-dist.bin if present)
+rocq    the same check run by vm_compute inside Rocq
 run     lrs, cert and check in sequence
 report  tabulate the measurements of the selected instances (TSV)
 clean   remove the generated files of an instance
