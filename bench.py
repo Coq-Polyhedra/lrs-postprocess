@@ -100,13 +100,15 @@ class Config:
         self.rocq_timeout = args.rocq_timeout
         self.sources = Path(args.sources).resolve()
         self.force = args.force
+        self.out_suffix = args.out_suffix
 
     def ine(self, base): return self.data / f"{base}.ine"
     def ext(self, base): return self.data / f"{base}.ext"
     def cert(self, base): return self.data / f"{base}-cert.bin"
     def dist(self, base): return self.data / f"{base}-dist.bin"
-    def log(self, base, stage): return self.data / f"{base}-{stage}.log"
-    def record(self, base, stage): return self.data / f"{base}-{stage}-timings.json"
+    def log(self, base, stage): return self.data / f"{base}-{stage}{self.out_suffix}.log"
+    def record(self, base, stage): return self.data / f"{base}-{stage}{self.out_suffix}-timings.json"
+    def base_record(self, base, stage): return self.data / f"{base}-{stage}-timings.json"
 
 
 # ---------------------------------------------------------------------------
@@ -129,7 +131,13 @@ def read_record(cfg, base, stage):
     try:
         return json.loads(cfg.record(base, stage).read_text())
     except (OSError, ValueError):
-        return None
+        pass
+    if cfg.out_suffix:  # fall back to the canonical record (e.g. the lrs reference)
+        try:
+            return json.loads(cfg.base_record(base, stage).read_text())
+        except (OSError, ValueError):
+            pass
+    return None
 
 
 def write_record(cfg, base, stage, timed, **fields):
@@ -519,6 +527,11 @@ def main():
                         help="Rocq toplevel (default: coqtop, from the PATH)")
     parser.add_argument("--rocq-timeout", type=float, default=3600, metavar="SECS",
                         help="kill a Rocq check after this long (default: 3600)")
+    parser.add_argument("--out-suffix", default="", metavar="SUF",
+                        help="append SUF to the names of the timing and log files this run writes "
+                             "(BASE-<stage>SUF-timings.json), keeping the canonical records intact; "
+                             "reads fall back to the canonical records when the suffixed ones are "
+                             "absent (e.g. the lrs reference time)")
     parser.add_argument("--sources", default="data/sources.json", metavar="FILE",
                         help="JSON object mapping instances to the source vertex of their distance "
                              "certificate, a position in the coordinate order of the vertices "
