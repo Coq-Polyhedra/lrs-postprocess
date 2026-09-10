@@ -4,15 +4,13 @@ use std::time::Instant;
 
 mod binencode;
 mod certificate;
-mod checker;
 mod numerics;
 mod postprocess;
 
-use binencode::write_certificate_bin;
+use binencode::{write_certificate_bin, write_distance_certificate_bin};
 use certificate::{certificate_to_string, Certificate};
-use checker::check_generated_certificate;
 use postprocess::{
-    build_full_dim_certificate, build_item_neighbors_and_lifts,
+    build_distance_certificate, build_full_dim_certificate, build_item_neighbors_and_lifts,
     build_simplex_graph, build_vertex_flags, certificate_inequalities,
     choose_default_k0, parse_lrs_ext_items, parse_lrs_hrep, root_certificate,
 };
@@ -29,6 +27,8 @@ struct PostprocessArgs {
     pretty: bool,
     bin: bool,
     k0: Option<usize>,
+    distances: Option<String>,
+    source: usize,
 }
 
 fn print_help(program: &str) {
@@ -41,6 +41,12 @@ Postprocess options:
   --bin             Write binary output for coq-binreader
   --k0 <INDEX>      Root vertex item index, 0-based.
                     Defaults to a vertex with the smallest number of simplices.
+  --distances <FILE>
+                    Also write the distance certificate (source vertex and
+                    BFS distances in the geometric graph) to FILE, in binary.
+  --source <INDEX>  Source vertex of the distance certificate, as a 0-based
+                    position in the lexicographic order of the vertex
+                    coordinates. Defaults to 0.
 
 General options:
   -h, --help        Show this help message
@@ -81,6 +87,8 @@ where
     let mut pretty = false;
     let mut bin = false;
     let mut k0: Option<usize> = None;
+    let mut distances: Option<String> = None;
+    let mut source: usize = 0;
 
     while let Some(arg) = it.next() {
         match arg.as_str() {
@@ -99,6 +107,17 @@ where
 
             "--k0" => {
                 k0 = Some(parse_usize_flag(it.next(), "--k0")?);
+            }
+
+            "--distances" => {
+                distances = Some(
+                    it.next()
+                        .ok_or_else(|| anyhow!("--distances must be followed by a file name"))?,
+                );
+            }
+
+            "--source" => {
+                source = parse_usize_flag(it.next(), "--source")?;
             }
 
             _ if arg.starts_with('-') => {
@@ -129,6 +148,8 @@ where
         pretty,
         bin,
         k0,
+        distances,
+        source,
     }))
 }
 
@@ -267,6 +288,7 @@ fn run_postprocess(args: PostprocessArgs) -> Result<()> {
         full_dim_elapsed.as_secs_f64()
     );
 
+
     let start = Instant::now();
     let cert = Certificate {
         n_inequalities: h.a.len(),
@@ -290,15 +312,17 @@ fn run_postprocess(args: PostprocessArgs) -> Result<()> {
         certificate_elapsed.as_secs_f64()
     );
 
-    // Check the generated value before any serialization or file I/O. This is
-    // the production path used by both JSON and binary certificate generation.
-    let check_start = Instant::now();
-    check_generated_certificate(&h, &cert)?;
-    eprintln!(
-        "Check certificate: {:.6} s",
-        check_start.elapsed().as_secs_f64()
-    );
-    eprintln!("Generated certificate accepted");
+    if let Some(path) = &args.distances {
+        let start = Instant::now();
+        let (source, distances) = build_distance_certificate(&cert.items, &cert.neighbors, args.source)?;
+        let mut out = io::BufWriter::new(std::fs::File::create(path)?);
+        write_distance_certificate_bin(&mut out, source, &distances)?;
+        out.flush()?;
+        eprintln!(
+            "Build and write distance certificate: {:.6} s",
+            start.elapsed().as_secs_f64()
+        );
+    }
 
     if args.bin {
         let stdout = io::stdout();

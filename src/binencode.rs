@@ -427,6 +427,21 @@ fn write_certificate_value<W: Write>(w: &mut W, cert: &Certificate) -> Result<()
     Ok(())
 }
 
+/// The distance certificate, a file of its own: the source vertex index and
+/// the distance of every vertex from it, in vertex order.
+///   distance_certificate := source * distances
+pub fn write_distance_certificate_bin<W: Write>(
+    w: &mut W,
+    source: usize,
+    distances: &[usize],
+) -> anyhow::Result<()> {
+    let d = pair(Descr::Int63, array(Descr::Int63));
+    write_descr(w, &d)?;
+    write_int63_usize(w, source)?;
+    write_usize_array(w, distances)?;
+    Ok(())
+}
+
 pub fn write_certificate_bin<W: Write>(
     w: &mut W,
     cert: &crate::certificate::Certificate,

@@ -1,3 +1,5 @@
+use std::cmp::Ordering;
+use std::collections::VecDeque;
 use anyhow::{anyhow, bail, Context, Result};
 use rug::{Complete, Integer};
 use std::collections::{hash_map::Entry, BTreeMap, HashMap};
@@ -900,6 +902,55 @@ pub fn build_vertex_flags(
     }
 
     Ok(flags)
+}
+
+/// Orders two vertices lexicographically by their rational coordinates. The
+/// denominators are positive, so the comparison cross-multiplies.
+fn compare_coords(a: &VertexCoords, b: &VertexCoords) -> Ordering {
+    for (x, y) in a.num.iter().zip(&b.num) {
+        let lhs = (x * &b.den).complete();
+        let rhs = (y * &a.den).complete();
+        match lhs.cmp(&rhs) {
+            Ordering::Equal => continue,
+            other => return other,
+        }
+    }
+    a.num.len().cmp(&b.num.len())
+}
+
+/// The distance certificate: the source is the vertex at `source_position`
+/// in the lexicographic order of vertex coordinates (a numbering independent
+/// of the enumeration order and of the facet numbering), and the distances
+/// are the BFS distances from it in the geometric graph. Every vertex must be
+/// reachable.
+pub fn build_distance_certificate(
+    items: &[VertexItem],
+    neighbors: &[Vec<usize>],
+    source_position: usize,
+) -> Result<(usize, Vec<usize>)> {
+    let n = items.len();
+    if source_position >= n {
+        bail!("--source={source_position} is out of range; there are {n} vertices");
+    }
+    let mut order: Vec<usize> = (0..n).collect();
+    order.sort_by(|&a, &b| compare_coords(&items[a].vertex, &items[b].vertex));
+    let source = order[source_position];
+
+    let mut distances = vec![usize::MAX; n];
+    distances[source] = 0;
+    let mut queue = VecDeque::from([source]);
+    while let Some(u) = queue.pop_front() {
+        for &v in &neighbors[u] {
+            if distances[v] == usize::MAX {
+                distances[v] = distances[u] + 1;
+                queue.push_back(v);
+            }
+        }
+    }
+    if let Some(v) = distances.iter().position(|&d| d == usize::MAX) {
+        bail!("vertex {v} is not reachable from the source vertex {source}");
+    }
+    Ok((source, distances))
 }
 
 pub fn choose_default_k0(items: &[VertexItem], graph: &SimplexGraph) -> Result<usize> {
