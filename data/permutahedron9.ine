@@ -1,4 +1,4 @@
-permutohedron order 10; dimension 9
+permutahedron order 10; dimension 9
 * Full-dimensional projection of the order-10 permutohedron.
 * Coordinates x_1,...,x_d are the first d coordinates; the last coordinate is eliminated.
 H-representation

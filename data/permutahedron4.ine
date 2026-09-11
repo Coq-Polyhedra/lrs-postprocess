@@ -1,4 +1,4 @@
-permutohedron order 5; dimension 4
+permutahedron order 5; dimension 4
 H-representation
 begin
 30 5 integer
