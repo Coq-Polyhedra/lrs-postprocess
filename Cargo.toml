@@ -1,6 +1,7 @@
 [package]
 name = "lrs-postprocess"
 version = "0.2.0"
+license = "CECILL-B"
 edition = "2021"
 
 [dependencies]
