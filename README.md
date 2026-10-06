@@ -5,7 +5,7 @@ in a binary format readable from Coq using
 [`coq-binreader`](https://github.com/Coq-Polyhedra/coq-binreader). The
 certificates are checked by the verified checker of `homology-checker`.
 
-The tool trusts the `lrs` enumeration output. Vertex coordinates and rational
+The tool uses the output of the lrslib enumeration algorithm. Vertex coordinates and rational
 numbers are kept as strings in the JSON certificate.
 
 ## Build
@@ -192,3 +192,7 @@ Options:
 The tool performs no check of its own: the certificate it writes is validated
 by the verified checker (extracted to OCaml, or run inside Rocq), which is
 where any inconsistency with the input H-representation is detected.
+
+## License
+
+CeCILL-B, see LICENSE.
